@@ -104,12 +104,20 @@ export function playDndChime(type: 'silent' | 'normal' | 'vibrate' | 'priority' 
       osc.start(ctx.currentTime);
       osc.stop(ctx.currentTime + 0.35);
     } else if (type === 'ring') {
-      osc.type = 'square';
-      osc.frequency.setValueAtTime(853, ctx.currentTime);
-      gain.gain.setValueAtTime(0.2, ctx.currentTime);
-      gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.5);
-      osc.start(ctx.currentTime);
-      osc.stop(ctx.currentTime + 0.5);
+      osc.type = 'sine';
+      const now = ctx.currentTime;
+      osc.frequency.setValueAtTime(440, now);
+      gain.gain.setValueAtTime(0.001, now);
+      // Two classic ring bursts
+      gain.gain.linearRampToValueAtTime(0.24, now + 0.03);
+      gain.gain.setValueAtTime(0.24, now + 0.35);
+      gain.gain.linearRampToValueAtTime(0.001, now + 0.42);
+      gain.gain.setValueAtTime(0.001, now + 0.58);
+      gain.gain.linearRampToValueAtTime(0.24, now + 0.62);
+      gain.gain.setValueAtTime(0.24, now + 0.95);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + 1.05);
+      osc.start(now);
+      osc.stop(now + 1.08);
     } else {
       // Gentle upward tone for exiting DND / restoring normal ringer
       osc.type = 'sine';

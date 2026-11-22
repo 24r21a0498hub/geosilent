@@ -13,13 +13,16 @@ import {
   ShieldCheck,
   AlertCircle
 } from 'lucide-react';
-import { Zone, Location } from '../types';
+import { Zone, Location, MapTheme } from '../types';
 import { formatDistance, getDistance } from '../utils';
+import GeofencePickerMap from './GeofencePickerMap';
+import { useMapsEnvironment } from './MapsProviderWrapper';
 
 interface EditRadiusModalProps {
   isOpen: boolean;
   zone: Zone | null;
   userLocation: Location | null;
+  mapTheme?: MapTheme;
   onClose: () => void;
   onSave: (zoneId: string, newRadius: number) => void;
 }
@@ -37,9 +40,11 @@ export default function EditRadiusModal({
   isOpen,
   zone,
   userLocation,
+  mapTheme = 'light',
   onClose,
   onSave,
 }: EditRadiusModalProps) {
+  const { hasMapsKey } = useMapsEnvironment();
   const [radius, setRadius] = useState<number>(zone ? zone.radius : 100);
   const [inputValue, setInputValue] = useState<string>(zone ? String(zone.radius) : '100');
 
@@ -144,91 +149,117 @@ export default function EditRadiusModal({
           </div>
 
           <form onSubmit={handleFormSubmit} className="p-5 overflow-y-auto space-y-4 text-slate-800">
-            {/* Visual Perimeter Simulation Box */}
-            <div className="bg-slate-900 rounded-2xl p-4 text-white relative overflow-hidden flex flex-col items-center justify-center">
-              {/* Grid Background */}
-              <div 
-                className="absolute inset-0 opacity-15" 
-                style={{ 
-                  backgroundImage: 'radial-gradient(#818cf8 1px, transparent 1px)', 
-                  backgroundSize: '14px 14px' 
-                }} 
-              />
-
-              {/* Concentric Circle Preview */}
-              <div className="relative w-36 h-36 flex items-center justify-center my-1">
-                {/* Outer guide ring */}
-                <div className="absolute inset-0 rounded-full border border-slate-700/60 border-dashed" />
-                
-                {/* Original radius dashed ring */}
+            {/* Interactive Google Maps or Fallback Radar Perimeter Preview */}
+            {hasMapsKey ? (
+              <div className="space-y-2">
+                <GeofencePickerMap
+                  centerLat={zone.lat}
+                  centerLng={zone.lng}
+                  radius={radius}
+                  userLat={userLocation?.lat}
+                  userLng={userLocation?.lng}
+                  mapTheme={mapTheme}
+                  interactive={true}
+                  editableRadius={true}
+                  onRadiusChange={(nextRadius) => {
+                    setRadius(nextRadius);
+                    setInputValue(String(nextRadius));
+                  }}
+                  heightClassName="h-44"
+                  label={
+                    currentDistance !== null
+                      ? isInsideWithNewRadius
+                        ? `Inside perimeter (${Math.round(currentDistance)}m away • DND active)`
+                        : `${Math.round(currentDistance - radius)}m outside perimeter`
+                      : `Geofence radius: ${radius}m (drag edge to resize)`
+                  }
+                />
+              </div>
+            ) : (
+              <div className="bg-slate-900 rounded-2xl p-4 text-white relative overflow-hidden flex flex-col items-center justify-center">
+                {/* Grid Background */}
                 <div 
-                  className="absolute rounded-full border border-slate-500/40 border-dashed transition-all duration-300"
-                  style={{
-                    width: `${Math.min(136, Math.max(30, (zone.radius / 300) * 120))}px`,
-                    height: `${Math.min(136, Math.max(30, (zone.radius / 300) * 120))}px`,
-                  }}
-                  title={`Original radius: ${zone.radius}m`}
+                  className="absolute inset-0 opacity-15" 
+                  style={{ 
+                    backgroundImage: 'radial-gradient(#818cf8 1px, transparent 1px)', 
+                    backgroundSize: '14px 14px' 
+                  }} 
                 />
 
-                {/* Adjusted radius animated area */}
-                <motion.div 
-                  className={`absolute rounded-full transition-all duration-300 ${
-                    isInsideWithNewRadius 
-                      ? 'bg-indigo-500/35 border-2 border-indigo-400 shadow-[0_0_20px_rgba(99,102,241,0.4)]' 
-                      : 'bg-indigo-600/20 border-2 border-indigo-500/80'
-                  }`}
-                  style={{
-                    width: `${Math.min(140, Math.max(26, (radius / 300) * 120))}px`,
-                    height: `${Math.min(140, Math.max(26, (radius / 300) * 120))}px`,
-                  }}
-                />
+                {/* Concentric Circle Preview */}
+                <div className="relative w-36 h-36 flex items-center justify-center my-1">
+                  {/* Outer guide ring */}
+                  <div className="absolute inset-0 rounded-full border border-slate-700/60 border-dashed" />
+                  
+                  {/* Original radius dashed ring */}
+                  <div 
+                    className="absolute rounded-full border border-slate-500/40 border-dashed transition-all duration-300"
+                    style={{
+                      width: `${Math.min(136, Math.max(30, (zone.radius / 300) * 120))}px`,
+                      height: `${Math.min(136, Math.max(30, (zone.radius / 300) * 120))}px`,
+                    }}
+                    title={`Original radius: ${zone.radius}m`}
+                  />
 
-                {/* Center marker */}
-                <div className="w-3.5 h-3.5 rounded-full bg-indigo-400 ring-4 ring-indigo-500/30 flex items-center justify-center z-10">
-                  <div className="w-1.5 h-1.5 rounded-full bg-white" />
+                  {/* Adjusted radius animated area */}
+                  <motion.div 
+                    className={`absolute rounded-full transition-all duration-300 ${
+                      isInsideWithNewRadius 
+                        ? 'bg-indigo-500/35 border-2 border-indigo-400 shadow-[0_0_20px_rgba(99,102,241,0.4)]' 
+                        : 'bg-indigo-600/20 border-2 border-indigo-500/80'
+                    }`}
+                    style={{
+                      width: `${Math.min(140, Math.max(26, (radius / 300) * 120))}px`,
+                      height: `${Math.min(140, Math.max(26, (radius / 300) * 120))}px`,
+                    }}
+                  />
+
+                  {/* Center marker */}
+                  <div className="w-3.5 h-3.5 rounded-full bg-indigo-400 ring-4 ring-indigo-500/30 flex items-center justify-center z-10">
+                    <div className="w-1.5 h-1.5 rounded-full bg-white" />
+                  </div>
+
+                  {/* User location dot relative to center if distance is known */}
+                  {currentDistance !== null && (
+                    <div 
+                      className="absolute z-10 transition-all duration-300"
+                      style={{
+                        transform: `translate(${Math.min(58, Math.max(-58, (currentDistance / 300) * 50))}px, -15px)`,
+                      }}
+                      title={`User: ${Math.round(currentDistance)}m away`}
+                    >
+                      <div className="relative">
+                        <div className="w-3 h-3 rounded-full bg-emerald-400 ring-2 ring-emerald-300 shadow-sm animate-pulse" />
+                        <span className="absolute -bottom-4 left-1/2 -translate-x-1/2 text-[9px] font-mono text-emerald-300 whitespace-nowrap bg-slate-950/80 px-1 rounded">
+                          You ({Math.round(currentDistance)}m)
+                        </span>
+                      </div>
+                    </div>
+                  )}
                 </div>
 
-                {/* User location dot relative to center if distance is known */}
-                {currentDistance !== null && (
-                  <div 
-                    className="absolute z-10 transition-all duration-300"
-                    style={{
-                      // Place the user point along an angle
-                      transform: `translate(${Math.min(58, Math.max(-58, (currentDistance / 300) * 50))}px, -15px)`,
-                    }}
-                    title={`User: ${Math.round(currentDistance)}m away`}
-                  >
-                    <div className="relative">
-                      <div className="w-3 h-3 rounded-full bg-emerald-400 ring-2 ring-emerald-300 shadow-sm animate-pulse" />
-                      <span className="absolute -bottom-4 left-1/2 -translate-x-1/2 text-[9px] font-mono text-emerald-300 whitespace-nowrap bg-slate-950/80 px-1 rounded">
-                        You ({Math.round(currentDistance)}m)
+                {/* Dynamic Geofence Status Badge */}
+                <div className="mt-2 text-center z-10">
+                  {currentDistance !== null ? (
+                    isInsideWithNewRadius ? (
+                      <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-bold bg-indigo-500/30 text-indigo-200 border border-indigo-400/40">
+                        <ShieldCheck size={13} className="text-indigo-300" />
+                        User is inside perimeter (DND active)
                       </span>
-                    </div>
-                  </div>
-                )}
-              </div>
-
-              {/* Dynamic Geofence Status Badge */}
-              <div className="mt-2 text-center z-10">
-                {currentDistance !== null ? (
-                  isInsideWithNewRadius ? (
-                    <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-bold bg-indigo-500/30 text-indigo-200 border border-indigo-400/40">
-                      <ShieldCheck size={13} className="text-indigo-300" />
-                      User is inside perimeter (DND active)
-                    </span>
+                    ) : (
+                      <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-medium bg-slate-800 text-slate-300 border border-slate-700">
+                        <MapPin size={12} className="text-slate-400" />
+                        {Math.round(currentDistance - radius)}m outside perimeter
+                      </span>
+                    )
                   ) : (
-                    <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-medium bg-slate-800 text-slate-300 border border-slate-700">
-                      <MapPin size={12} className="text-slate-400" />
-                      {Math.round(currentDistance - radius)}m outside perimeter
+                    <span className="text-[11px] text-slate-400">
+                      Radius perimeter: {radius} meters
                     </span>
-                  )
-                ) : (
-                  <span className="text-[11px] text-slate-400">
-                    Radius perimeter: {radius} meters
-                  </span>
-                )}
+                  )}
+                </div>
               </div>
-            </div>
+            )}
 
             {/* Stepper and Number Input */}
             <div>

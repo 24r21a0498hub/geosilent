@@ -20,9 +20,11 @@ import {
   CheckCircle2,
   Sliders,
   MapPin,
-  Sparkles
+  Sparkles,
+  ShieldCheck
 } from 'lucide-react';
 import { PhoneBridgeConfig } from '../types';
+import { InbuiltDndStatus } from '../utils/nativeDndBridge';
 
 interface PhoneHardwareBridgeModalProps {
   isOpen: boolean;
@@ -30,6 +32,9 @@ interface PhoneHardwareBridgeModalProps {
   config: PhoneBridgeConfig;
   onSaveConfig: (updated: PhoneBridgeConfig) => void;
   onTestBridge: (turnOn: boolean) => Promise<boolean>;
+  isInbuiltApk?: boolean;
+  inbuiltDndStatus?: InbuiltDndStatus | null;
+  onRequestInbuiltDndPermission?: () => void;
 }
 
 export default function PhoneHardwareBridgeModal({
@@ -38,9 +43,11 @@ export default function PhoneHardwareBridgeModal({
   config,
   onSaveConfig,
   onTestBridge,
+  isInbuiltApk = false,
+  inbuiltDndStatus = null,
+  onRequestInbuiltDndPermission,
 }: PhoneHardwareBridgeModalProps) {
-  // Default to built-in phone features (NO third-party apps required!)
-  const [activeTab, setActiveTab] = useState<'built_in' | 'shortcuts' | 'macrodroid' | 'apk'>('built_in');
+  const [activeTab, setActiveTab] = useState<'built_in' | 'shortcuts' | 'macrodroid'>('built_in');
   const [brandTab, setBrandTab] = useState<'samsung' | 'pixel' | 'iphone' | 'xiaomi_oneplus'>('samsung');
   const [copiedText, setCopiedText] = useState<string | null>(null);
   const [testStatus, setTestStatus] = useState<string | null>(null);
@@ -161,9 +168,13 @@ export default function PhoneHardwareBridgeModal({
         <div className="bg-emerald-50 border-b border-emerald-200/80 px-5 py-3 text-emerald-950 text-xs flex items-start gap-2.5">
           <CheckCircle2 size={18} className="text-emerald-600 shrink-0 mt-0.5" />
           <div className="leading-relaxed">
-            <strong className="font-bold text-emerald-900">Can you activate DND without 3rd-party apps?</strong>
+            <strong className="font-bold text-emerald-900">
+              {isInbuiltApk ? 'Native Android NotificationManager Connected' : 'Built-in Phone Rules (Zero 3rd-Party Apps)'}
+            </strong>
             <p className="text-[11px] text-emerald-800 mt-0.5">
-              <strong>YES!</strong> Every modern smartphone has <strong>100% built-in location and automated DND rules</strong> inside its native OS settings. You do not need to install any apps!
+              {isInbuiltApk
+                ? 'Android NotificationManager is active directly on this device with zero external apps.'
+                : 'Use your phone’s native Modes & Routines or 1-Tap OS DND Access — no extra apps required.'}
             </p>
           </div>
         </div>
@@ -179,7 +190,7 @@ export default function PhoneHardwareBridgeModal({
                 : 'border-transparent text-slate-500 hover:text-slate-800'
             }`}
           >
-            ✨ Built-in Phone Rules (0 Apps)
+            ✨ Built-in Phone Rules
           </button>
           <button
             type="button"
@@ -202,17 +213,6 @@ export default function PhoneHardwareBridgeModal({
             }`}
           >
             🤖 Webhook Bridge (Optional)
-          </button>
-          <button
-            type="button"
-            onClick={() => setActiveTab('apk')}
-            className={`pb-2.5 px-3 font-bold border-b-2 whitespace-nowrap transition cursor-pointer ${
-              activeTab === 'apk'
-                ? 'border-indigo-600 text-indigo-700'
-                : 'border-transparent text-slate-500 hover:text-slate-800'
-            }`}
-          >
-            📦 Native APK
           </button>
         </div>
 
@@ -535,58 +535,12 @@ export default function PhoneHardwareBridgeModal({
             </div>
           )}
 
-          {/* TAB 4: Native APK Wrapper Instructions */}
-          {activeTab === 'apk' && (
-            <div className="space-y-3.5 text-xs">
-              <div className="bg-slate-50 p-3.5 rounded-2xl border border-slate-200 space-y-1.5">
-                <h4 className="font-bold text-slate-800 flex items-center gap-1.5">
-                  <Code size={14} className="text-indigo-600" />
-                  Compile into a Standalone Native Android APK
-                </h4>
-                <p className="text-[11px] text-slate-600 leading-relaxed">
-                  If you want an installed native app on your phone with direct access to Android's <code>android.app.NotificationManager</code>, wrap this code in Capacitor:
-                </p>
-              </div>
-
-              <div className="space-y-2">
-                <div className="bg-slate-900 text-slate-200 rounded-xl p-3 font-mono text-[11px] relative">
-                  <button
-                    type="button"
-                    onClick={() => handleCopy(`npm i @capacitor/core @capacitor/cli @capacitor/android\nnpx cap add android\nnpx cap run android`, 'bash')}
-                    className="absolute top-2 right-2 px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-[10px] text-slate-300 flex items-center gap-1 transition"
-                  >
-                    {copiedText === 'bash' ? <Check size={10} className="text-emerald-400" /> : <Copy size={10} />}
-                    {copiedText === 'bash' ? 'Copied' : 'Copy'}
-                  </button>
-                  <p className="text-indigo-400 font-bold mb-1"># Terminal</p>
-                  <code>npm i @capacitor/core @capacitor/cli @capacitor/android</code><br />
-                  <code>npx cap add android</code><br />
-                  <code>npx cap run android</code>
-                </div>
-
-                <div className="bg-slate-900 text-slate-200 rounded-xl p-3 font-mono text-[11px] relative">
-                  <button
-                    type="button"
-                    onClick={() => handleCopy(`<uses-permission android:name="android.permission.ACCESS_NOTIFICATION_POLICY" />\n<uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />`, 'manifest')}
-                    className="absolute top-2 right-2 px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-[10px] text-slate-300 flex items-center gap-1 transition"
-                  >
-                    {copiedText === 'manifest' ? <Check size={10} className="text-emerald-400" /> : <Copy size={10} />}
-                    {copiedText === 'manifest' ? 'Copied' : 'Copy'}
-                  </button>
-                  <p className="text-indigo-400 font-bold mb-1"># AndroidManifest.xml</p>
-                  <code>&lt;uses-permission android:name="android.permission.ACCESS_NOTIFICATION_POLICY" /&gt;</code><br />
-                  <code>&lt;uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" /&gt;</code>
-                </div>
-              </div>
-            </div>
-          )}
-
         </div>
 
         {/* Modal Footer */}
         <div className="px-6 py-3.5 bg-slate-50 border-t border-slate-100 flex items-center justify-between">
           <span className="text-[11px] text-slate-500 font-medium">
-            Zero 3rd-party apps required for built-in phone rules
+            Native Android NotificationManager &amp; Built-in OS Controls
           </span>
           <div className="flex items-center gap-2">
             <button

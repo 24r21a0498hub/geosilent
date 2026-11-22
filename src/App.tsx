@@ -51,7 +51,11 @@ import {
   ShieldAlert,
   PhoneCall,
   Smartphone,
-  ExternalLink
+  ExternalLink,
+  Lock,
+  Unlock,
+  Shield,
+  AlertTriangle
 } from 'lucide-react';
 import { Zone, Location, DndEvent, TimeScheduleOverride, MapTheme, QuickMuteSession, SilenceMode, VipContact, EmergencyBypassConfig, PhoneBridgeConfig, MapsGroundingMetadata } from './types';
 import { 
@@ -63,6 +67,8 @@ import {
   isScheduleActiveNow
 } from './utils';
 import ZonesVisualMap from './components/ZonesVisualMap';
+import { MapsProviderWrapper } from './components/MapsProviderWrapper';
+import GeofencePickerMap from './components/GeofencePickerMap';
 import ZoneBackupModal from './components/ZoneBackupModal';
 import ZoneStatistics from './components/ZoneStatistics';
 import EditRadiusModal from './components/EditRadiusModal';
@@ -77,6 +83,25 @@ import PhoneHardwareCard from './components/PhoneHardwareCard';
 import PhoneHardwareBridgeModal from './components/PhoneHardwareBridgeModal';
 import PlaceSearchInput, { GroundedPlaceResult } from './components/PlaceSearchInput';
 import QuietPlaceDiscoveryModal from './components/QuietPlaceDiscoveryModal';
+import SmartModesSelector, { SMART_MODE_PRESETS } from './components/SmartModesSelector';
+import { 
+  getOrCreatePairingInfo, 
+  initializeDeviceDocument, 
+  syncZonesToFirestore, 
+} from './services/firebaseSync';
+import { testFirestoreConnection } from './firebase';
+import { SmartZoneMode } from './types';
+import {
+  isInbuiltApkEnvironment,
+  getInbuiltDndStatus,
+  requestInbuiltDndPermission,
+  requestInbuiltEmergencyCallPermissions,
+  setInbuiltDndState,
+  syncZonesToInbuiltApk,
+  syncEmergencyConfigToInbuiltApk,
+  triggerInbuiltEmergencyTestRing,
+  InbuiltDndStatus,
+} from './utils/nativeDndBridge';
 
 const STORAGE_KEY = 'smart_silent_zones_v2';
 const DWELL_TIME_STORAGE_KEY = 'smart_silent_dwell_time_seconds';
@@ -88,6 +113,61 @@ const GPS_ACCURACY_STORAGE_KEY = 'smart_silent_gps_accuracy_history_v1';
 const EMERGENCY_BYPASS_STORAGE_KEY = 'smart_silent_emergency_bypass_v1';
 const WIFI_SSID_STORAGE_KEY = 'smart_silent_wifi_ssid_v1';
 const PHONE_BRIDGE_STORAGE_KEY = 'smart_silent_phone_bridge_v1';
+const LAST_KNOWN_LOCATION_KEY = 'smart_silent_last_known_location_v2';
+const CLASSROOM_LOCK_STORAGE_KEY = 'smart_silent_classroom_lock_v1';
+const EXIT_GRACE_STORAGE_KEY = 'smart_silent_exit_grace_seconds_v1';
+const FILTER_COARSE_GPS_STORAGE_KEY = 'smart_silent_filter_coarse_gps_v1';
+
+const getStoredExitGraceSeconds = (): number => {
+  try {
+    const saved = localStorage.getItem(EXIT_GRACE_STORAGE_KEY);
+    if (saved !== null) {
+      const parsed = parseInt(saved, 10);
+      if (!isNaN(parsed) && parsed >= 0 && parsed <= 60) return parsed;
+    }
+  } catch {}
+  return 25; // 25 seconds default exit grace verification period
+};
+
+const getStoredClassroomLockPref = (): boolean => {
+  try {
+    const saved = localStorage.getItem(CLASSROOM_LOCK_STORAGE_KEY);
+    if (saved !== null) return saved === 'true';
+  } catch {}
+  return true; // Default to true so classroom / quiet zones are automatically shielded from indoor drift
+};
+
+const getStoredFilterCoarseGps = (): boolean => {
+  try {
+    const saved = localStorage.getItem(FILTER_COARSE_GPS_STORAGE_KEY);
+    if (saved !== null) return saved === 'true';
+  } catch {}
+  return true; // Default to true
+};
+
+const getStoredLastKnownLocation = (savedZones: Zone[]): Location => {
+  try {
+    const saved = localStorage.getItem(LAST_KNOWN_LOCATION_KEY);
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      if (parsed && typeof parsed.lat === 'number' && typeof parsed.lng === 'number') {
+        return parsed;
+      }
+    }
+  } catch {}
+
+  // If user has saved zones (e.g. Class), anchor to the first zone
+  if (savedZones.length > 0 && typeof savedZones[0].lat === 'number') {
+    return {
+      lat: savedZones[0].lat,
+      lng: savedZones[0].lng,
+      accuracy: 10,
+    };
+  }
+
+  // Fallback to a neutral coordinate
+  return { lat: 17.3850, lng: 78.4867, accuracy: 10 };
+};
 
 const DEFAULT_PHONE_BRIDGE_CONFIG: PhoneBridgeConfig = {
   enabled: false,
@@ -294,12 +374,23 @@ export default function App() {
   const [dismissedSuggestedSpots, setDismissedSuggestedSpots] = useState<Set<string>>(new Set());
   const [realLocation, setRealLocation] = useState<Location | null>(null);
   const [isSimulating, setIsSimulating] = useState(false);
-  const [simulatedLocation, setSimulatedLocation] = useState<Location>({ lat: 37.7750, lng: -122.4194, accuracy: 10 });
+  const [simulatedLocation, setSimulatedLocation] = useState<Location>(() => getStoredLastKnownLocation(getStoredZones()));
   const [error, setError] = useState<string | null>(null);
   const userManuallySimulatingRef = useRef(false);
   const [initialAnchorLocation, setInitialAnchorLocation] = useState<Location | null>(null);
   const [recentExitZone, setRecentExitZone] = useState<{ name: string; timestamp: number } | null>(null);
   
+  // Exit Verification Grace Period (Anti-Drift Filter for Classroom / Indoor GPS Fluctuation)
+  const [exitGraceSeconds, setExitGraceSeconds] = useState<number>(getStoredExitGraceSeconds);
+  const [exitPendingZone, setExitPendingZone] = useState<Zone | null>(null);
+  const [exitSecondsRemaining, setExitSecondsRemaining] = useState<number>(0);
+  const exitTargetTimeRef = useRef<number | null>(null);
+
+  // Indoor Classroom Anti-Drift Shield (Anchors coordinates & stabilizes GPS in class)
+  const [classroomLockEnabled, setClassroomLockEnabled] = useState<boolean>(getStoredClassroomLockPref);
+  const [classroomLockActive, setClassroomLockActive] = useState<boolean>(false);
+  const [filterCoarseGps, setFilterCoarseGps] = useState<boolean>(getStoredFilterCoarseGps);
+
   // Settings
   const [autoDndEnabled, setAutoDndEnabled] = useState(true);
   const [soundFeedbackEnabled, setSoundFeedbackEnabled] = useState(true);
@@ -327,7 +418,79 @@ export default function App() {
     isRepeatCaller: boolean;
   }>({ isOpen: false, caller: null, isRepeatCaller: false });
 
-  // Physical Phone Hardware Bridge (MacroDroid / Tasker / Webhook / Direct Intents)
+  // Background Firestore Sync & Built-in DND State
+  const [pairingInfo] = useState<{ deviceId: string; pairingCode: string }>(getOrCreatePairingInfo);
+  const [selectedSmartMode, setSelectedSmartMode] = useState<SmartZoneMode>('college');
+  const [inbuiltApkMode] = useState<boolean>(() => isInbuiltApkEnvironment());
+  const [inbuiltDndStatus, setInbuiltDndStatus] = useState<InbuiltDndStatus | null>(() => getInbuiltDndStatus());
+  const [defaultRadiusMode, setDefaultRadiusMode] = useState<'silent' | 'vibrate'>(() => {
+    try {
+      const saved = localStorage.getItem('smart_silent_default_radius_mode_v1');
+      if (saved === 'vibrate' || saved === 'silent') return saved;
+    } catch {}
+    return 'silent';
+  });
+  const hasAutoPromptedDndRef = useRef(false);
+
+  // Refresh inbuilt Android NotificationManager DND status when running on Android WebView
+  useEffect(() => {
+    if (!inbuiltApkMode) return;
+    const refreshInbuiltStatus = () => {
+      setInbuiltDndStatus(getInbuiltDndStatus());
+    };
+    refreshInbuiltStatus();
+    window.addEventListener('android-native-dnd-update', refreshInbuiltStatus);
+    window.addEventListener('focus', refreshInbuiltStatus);
+    return () => {
+      window.removeEventListener('android-native-dnd-update', refreshInbuiltStatus);
+      window.removeEventListener('focus', refreshInbuiltStatus);
+    };
+  }, [inbuiltApkMode]);
+
+  // Keep emergency contacts & repeat-caller rules synced with inbuilt Call Receiver
+  useEffect(() => {
+    if (inbuiltApkMode) {
+      syncEmergencyConfigToInbuiltApk(emergencyConfig);
+    }
+  }, [emergencyConfig, inbuiltApkMode]);
+
+  // Direct DND Permission prompt (no extra app installations)
+  const askDndPermissionDirect = () => {
+    if (inbuiltApkMode) {
+      requestInbuiltDndPermission();
+      setTimeout(() => setInbuiltDndStatus(getInbuiltDndStatus()), 400);
+      return;
+    }
+    const isAndroidBrowser = typeof navigator !== 'undefined' && /android/i.test(navigator.userAgent);
+    if (isAndroidBrowser) {
+      try {
+        window.location.href = 'intent:#Intent;action=android.settings.NOTIFICATION_POLICY_ACCESS_SETTINGS;end';
+        return;
+      } catch {}
+    }
+    setIsPhoneBridgeModalOpen(true);
+  };
+
+  // Initialize Firestore background sync cleanly
+  useEffect(() => {
+    testFirestoreConnection();
+    initializeDeviceDocument(pairingInfo.deviceId, pairingInfo.pairingCode).catch((err) => {
+      console.error('Device initialization failed:', err);
+    });
+  }, [pairingInfo.deviceId, pairingInfo.pairingCode]);
+
+  // Synchronize zones to native geofencer & Firestore whenever zones list changes
+  useEffect(() => {
+    if (inbuiltApkMode) {
+      syncZonesToInbuiltApk(zones);
+    }
+    if (!pairingInfo.deviceId) return;
+    syncZonesToFirestore(pairingInfo.deviceId, zones).catch((err) => {
+      console.error('Error syncing zones to Firestore:', err);
+    });
+  }, [zones, pairingInfo.deviceId, inbuiltApkMode]);
+
+  // Physical Phone Hardware Bridge (Built-in DND & Vibration Sync)
   const [phoneBridgeConfig, setPhoneBridgeConfig] = useState<PhoneBridgeConfig>(getStoredPhoneBridgeConfig);
   const [isPhoneBridgeModalOpen, setIsPhoneBridgeModalOpen] = useState(false);
   const isFirstDndMountRef = useRef(true);
@@ -336,27 +499,52 @@ export default function App() {
   const [connectedWifiSsid, setConnectedWifiSsid] = useState<string>(getStoredWifiSsid);
   const [isWifiConnected, setIsWifiConnected] = useState<boolean>(true);
 
-  // Sync Physical Phone Hardware (Vibration & Automation Webhook)
+  // Sync Physical Phone Hardware (Built-in NotificationManager DND, Vibration Mode & Optional Webhook)
   const triggerPhoneHardwareSync = async (turnOn: boolean, zoneName?: string, silenceMode?: SilenceMode): Promise<boolean> => {
-    // 1. Physical Device Haptic Vibration
+    const resolvedMode = silenceMode || defaultRadiusMode;
+
+    // 1. Physical Device Haptic Vibration (distinct stronger pattern when Vibration Mode activates)
     if ('vibrate' in navigator && typeof navigator.vibrate === 'function') {
       try {
-        if (turnOn) {
-          navigator.vibrate([140, 70, 140]);
+        if (turnOn && resolvedMode === 'vibrate') {
+          navigator.vibrate([220, 90, 220, 90, 220]);
+        } else if (turnOn) {
+          navigator.vibrate([120, 60, 120]);
         } else {
           navigator.vibrate([80]);
         }
       } catch {}
     }
 
-    // 2. Automated Webhook Bridge (MacroDroid / Tasker / Home Assistant)
+    // 1b. Inbuilt Android NotificationManager DND / AudioManager Vibration (Zero extra apps)
+    if (inbuiltApkMode) {
+      const res = setInbuiltDndState(turnOn, resolvedMode, zoneName || 'Smart Silent Zone');
+      setInbuiltDndStatus(getInbuiltDndStatus());
+      if (res && res.granted) {
+        return res.success && (turnOn ? res.dndActive : !res.dndActive);
+      }
+      if (turnOn && !hasAutoPromptedDndRef.current) {
+        hasAutoPromptedDndRef.current = true;
+        requestInbuiltDndPermission();
+      } else if (headsUpAlertsEnabled) {
+        setNotification({
+          id: Date.now().toString(),
+          title: 'Allow DND Permission',
+          message: 'Allow Do Not Disturb access in Android Settings so your phone can switch DND / Vibration automatically.',
+          type: 'normal',
+        });
+      }
+      return false;
+    }
+
+    // 2. Automated Webhook Bridge (if configured)
     if (phoneBridgeConfig.enabled && phoneBridgeConfig.webhookUrl) {
       try {
         const targetUrl = new URL(phoneBridgeConfig.webhookUrl);
         targetUrl.searchParams.set('state', turnOn ? 'on' : 'off');
         targetUrl.searchParams.set('dnd', turnOn ? 'true' : 'false');
         targetUrl.searchParams.set('zone', zoneName || (turnOn ? 'Silent Zone' : 'Outside'));
-        targetUrl.searchParams.set('mode', silenceMode || 'silent');
+        targetUrl.searchParams.set('mode', resolvedMode);
 
         await fetch(targetUrl.toString(), {
           method: 'POST',
@@ -366,7 +554,7 @@ export default function App() {
             event: turnOn ? 'DND_ACTIVATED' : 'DND_DEACTIVATED',
             state: turnOn ? 'on' : 'off',
             zone: zoneName || 'Smart Silent Zone',
-            mode: silenceMode || 'silent',
+            mode: resolvedMode,
             timestamp: Date.now(),
           }),
         });
@@ -406,8 +594,44 @@ export default function App() {
   const [dwellSecondsRemaining, setDwellSecondsRemaining] = useState<number>(0);
   const dwellTargetTimeRef = useRef<number | null>(null);
 
+  const [activeZone, setActiveZone] = useState<Zone | null>(null);
+
   // Active Location (Simulated or Real)
-  const location = isSimulating ? simulatedLocation : realLocation;
+  const rawLocation = isSimulating ? simulatedLocation : realLocation;
+
+  // Stabilized Location with Classroom Anti-Drift Shield
+  const location = useMemo(() => {
+    if (!rawLocation) return null;
+    // When classroom lock is active and inside a zone, anchor coordinates to zone center to prevent indoor GPS jitter
+    if (classroomLockActive && activeZone) {
+      const dist = getDistance(rawLocation.lat, rawLocation.lng, activeZone.lat, activeZone.lng);
+      if (dist <= activeZone.radius * 2.5) {
+        return {
+          lat: activeZone.lat,
+          lng: activeZone.lng,
+          accuracy: Math.min(rawLocation.accuracy || 10, 15),
+        };
+      }
+    }
+    return rawLocation;
+  }, [rawLocation, classroomLockActive, activeZone]);
+
+  const toggleClassroomLock = () => {
+    setClassroomLockActive((prev) => {
+      const next = !prev;
+      if (headsUpAlertsEnabled) {
+        setNotification({
+          id: Date.now().toString(),
+          title: next ? 'Classroom Shield Engaged' : 'Classroom Shield Disengaged',
+          message: next
+            ? 'GPS drift locked to classroom perimeter. Phone ringer stays protected.'
+            : 'Classroom drift lock turned off. Standard GPS tracking active.',
+          type: next ? 'silent' : 'normal',
+        });
+      }
+      return next;
+    });
+  };
 
   // Set initial anchor when realLocation or initial simulatedLocation is available
   useEffect(() => {
@@ -422,19 +646,18 @@ export default function App() {
     if (initialSession && initialSession.active) return true;
     return isScheduleActiveNow(getStoredTimeOverride());
   });
-  const [activeZone, setActiveZone] = useState<Zone | null>(null);
   const [manualOverrideDndOff, setManualOverrideDndOff] = useState(false);
   const prevZoneRef = useRef<Zone | null>(null);
   const zoneEntryTimesRef = useRef<Record<string, number>>({});
 
-  // Automatically trigger physical phone sync whenever isDndActive transitions
+  // Automatically trigger physical phone sync whenever DND state, active zone, or mode changes
   useEffect(() => {
     if (isFirstDndMountRef.current) {
       isFirstDndMountRef.current = false;
       return;
     }
-    triggerPhoneHardwareSync(isDndActive, activeZone?.name, activeZone?.silenceMode);
-  }, [isDndActive]);
+    triggerPhoneHardwareSync(isDndActive, activeZone?.name, activeZone?.silenceMode || defaultRadiusMode);
+  }, [isDndActive, activeZone?.id, activeZone?.silenceMode, defaultRadiusMode]);
 
   // Persist Map Theme setting
   useEffect(() => {
@@ -755,19 +978,32 @@ export default function App() {
   // Auto-DND Activity Logs
   const [activityLogs, setActivityLogs] = useState<DndEvent[]>([]);
 
+  // Google Maps Quota Banner State (Case A Demo Key)
+  const [mapsQuotaExceeded, setMapsQuotaExceeded] = useState(false);
+
+  useEffect(() => {
+    const handleQuota = () => setMapsQuotaExceeded(true);
+    window.addEventListener('gmp-quota-exceeded', handleQuota);
+    return () => window.removeEventListener('gmp-quota-exceeded', handleQuota);
+  }, []);
+
   // Add Zone State
   const [isAddingZone, setIsAddingZone] = useState(false);
   const [newZoneName, setNewZoneName] = useState('');
   const [newZoneRadius, setNewZoneRadius] = useState('100');
-  const [newZoneSilenceMode, setNewZoneSilenceMode] = useState<SilenceMode>('silent');
+  const [newZoneSilenceMode, setNewZoneSilenceMode] = useState<SilenceMode>(defaultRadiusMode);
   const [newZoneWifiSsid, setNewZoneWifiSsid] = useState('');
   const [placementType, setPlacementType] = useState<'current' | 'ahead'>('current');
+  const [customZoneCoords, setCustomZoneCoords] = useState<{ lat: number; lng: number } | null>(null);
 
   const handleUpdateEmergencyConfig = (updated: EmergencyBypassConfig) => {
     setEmergencyConfig(updated);
     try {
       localStorage.setItem(EMERGENCY_BYPASS_STORAGE_KEY, JSON.stringify(updated));
     } catch {}
+    if (inbuiltApkMode) {
+      syncEmergencyConfigToInbuiltApk(updated);
+    }
   };
 
   const handleToggleWifi = () => {
@@ -788,6 +1024,9 @@ export default function App() {
   };
 
   const triggerSimulateCall = (contact: VipContact, isRepeatCaller = false) => {
+    if (inbuiltApkMode) {
+      triggerInbuiltEmergencyTestRing(contact.name, contact.phone);
+    }
     playDndChime('ring');
     setIncomingCallState({
       isOpen: true,
@@ -796,17 +1035,53 @@ export default function App() {
     });
   };
 
+  const handleSelectRadiusMode = (mode: 'silent' | 'vibrate') => {
+    setDefaultRadiusMode(mode);
+    setNewZoneSilenceMode(mode);
+    try {
+      localStorage.setItem('smart_silent_default_radius_mode_v1', mode);
+    } catch {}
+
+    if (activeZone) {
+      const updatedActive = { ...activeZone, silenceMode: mode };
+      setActiveZone(updatedActive);
+      prevZoneRef.current = updatedActive;
+      setZones((prev) =>
+        prev.map((z) => (z.id === activeZone.id ? { ...z, silenceMode: mode } : z))
+      );
+      if (isDndActive) {
+        triggerPhoneHardwareSync(true, activeZone.name, mode);
+        if (soundFeedbackEnabled) {
+          playDndChime(mode === 'vibrate' ? 'vibrate' : 'silent');
+        }
+      }
+      if (headsUpAlertsEnabled) {
+        setNotification({
+          id: Date.now().toString(),
+          title: mode === 'vibrate' ? 'Switched to Vibration Mode' : 'Switched to DND Mode',
+          message: `"${activeZone.name}" will use ${mode === 'vibrate' ? 'Vibration Only' : 'Total Silence (DND)'}.`,
+          type: 'silent',
+        });
+      }
+    }
+  };
+
   const cycleZoneSilenceMode = (zoneId: string) => {
     setZones((prev) =>
       prev.map((z) => {
         if (z.id === zoneId) {
           const current = z.silenceMode || 'silent';
           const next: SilenceMode = current === 'silent' ? 'vibrate' : current === 'vibrate' ? 'priority' : 'silent';
+          if (activeZone?.id === zoneId) {
+            const updated = { ...z, silenceMode: next };
+            setActiveZone(updated);
+            prevZoneRef.current = updated;
+          }
           if (headsUpAlertsEnabled) {
             setNotification({
               id: Date.now().toString(),
               title: `${z.name} Mode Updated`,
-              message: `Switched to ${next === 'silent' ? 'Total Silence (DND)' : next === 'vibrate' ? 'Vibrate Only' : 'Priority Only'}`,
+              message: `Switched to ${next === 'silent' ? 'DND Mode (Total Silence)' : next === 'vibrate' ? 'Vibration Mode' : 'Priority Only'}`,
               type: 'normal',
             });
           }
@@ -861,7 +1136,7 @@ export default function App() {
     return list;
   }, [zones, location?.lat, location?.lng, zoneSortBy, zoneSortOrder]);
 
-  // Track user location
+  // Track user location with Indoor GPS Spike Filtering and Local Persistence
   useEffect(() => {
     if (!('geolocation' in navigator)) {
       setError('Geolocation is not supported by your browser');
@@ -871,11 +1146,27 @@ export default function App() {
 
     const watchId = navigator.geolocation.watchPosition(
       (pos) => {
-        const fresh = {
+        const fresh: Location = {
           lat: pos.coords.latitude,
           lng: pos.coords.longitude,
           accuracy: pos.coords.accuracy,
         };
+
+        // Cache last known good fix to localStorage for instantaneous recovery
+        try {
+          localStorage.setItem(LAST_KNOWN_LOCATION_KEY, JSON.stringify(fresh));
+        } catch {}
+
+        // Indoor Noise Filter: if inside an active zone and filterCoarseGps is on,
+        // ignore wild indoor spikes (e.g. coarse cell-tower triangulation with accuracy > 65m)
+        if (filterCoarseGps && pos.coords.accuracy > 65 && activeZone) {
+          const jumpDist = getDistance(fresh.lat, fresh.lng, activeZone.lat, activeZone.lng);
+          if (jumpDist > activeZone.radius * 2) {
+            console.log(`Suppressed coarse indoor GPS spike (±${Math.round(pos.coords.accuracy)}m, jump: ${Math.round(jumpDist)}m)`);
+            return;
+          }
+        }
+
         setRealLocation(fresh);
         setError(null);
         // If user hasn't explicitly clicked to simulate, keep following real GPS
@@ -885,17 +1176,15 @@ export default function App() {
       },
       (err) => {
         setError(err.message);
-        if (!realLocation) {
-          setIsSimulating(true);
-        }
+        // Retain previous location if GPS drops out inside thick walls
       },
-      { enableHighAccuracy: true, maximumAge: 5000, timeout: 15000 }
+      { enableHighAccuracy: true, maximumAge: 4000, timeout: 12000 }
     );
 
     return () => {
       navigator.geolocation.clearWatch(watchId);
     };
-  }, []);
+  }, [activeZone, filterCoarseGps]);
 
   // Dismiss notification automatically after 4.5s
   useEffect(() => {
@@ -906,7 +1195,122 @@ export default function App() {
     return () => clearTimeout(timer);
   }, [notification]);
 
-  // Core Geofencing & Automatic DND Engine
+  // Confirm Final Zone Exit (Called after exit grace period or manual confirmation)
+  const confirmZoneExit = (exitingZone: Zone) => {
+    setExitPendingZone(null);
+    exitTargetTimeRef.current = null;
+    setExitSecondsRemaining(0);
+    setClassroomLockActive(false);
+
+    prevZoneRef.current = null;
+    setActiveZone(null);
+    setManualOverrideDndOff(false);
+
+    setRecentExitZone({
+      name: exitingZone.name,
+      timestamp: Date.now(),
+    });
+    setTimeout(() => setRecentExitZone(null), 4000);
+
+    const entryTime = zoneEntryTimesRef.current[exitingZone.id] || (Date.now() - 45000);
+    const elapsed = Math.max(20, Math.round((Date.now() - entryTime) / 1000));
+    delete zoneEntryTimesRef.current[exitingZone.id];
+
+    setZones((curr) =>
+      curr.map((z) =>
+        z.id === exitingZone.id
+          ? {
+              ...z,
+              totalDurationSeconds: (z.totalDurationSeconds ?? 0) + elapsed,
+              lastEnteredAt: null,
+            }
+          : z
+      )
+    );
+
+    if (autoDndEnabled) {
+      if (quickMuteSession?.active) {
+        setIsDndActive(true);
+      } else if (isScheduleActive && !manualOverrideDndOff) {
+        setIsDndActive(true);
+      } else {
+        setIsDndActive(false);
+        if (soundFeedbackEnabled) {
+          playDndChime('normal');
+        }
+        if (headsUpAlertsEnabled) {
+          setNotification({
+            id: Date.now().toString(),
+            title: 'Normal Mode Restored',
+            message: `Left "${exitingZone.name}". Do Not Disturb turned off automatically.`,
+            type: 'normal',
+          });
+        }
+        setActivityLogs((prev) => [
+          {
+            id: Date.now().toString(),
+            timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+            type: 'exit',
+            zoneName: exitingZone.name,
+            detail: `Exit verified (${exitGraceSeconds}s debounce): Normal ringer restored after leaving perimeter`,
+          },
+          ...prev.slice(0, 9),
+        ]);
+      }
+    }
+  };
+
+  // Cancel Exit Grace Period (User is still in class / GPS bounced back)
+  const cancelExitGrace = () => {
+    if (exitPendingZone) {
+      const zoneName = exitPendingZone.name;
+      setExitPendingZone(null);
+      exitTargetTimeRef.current = null;
+      setExitSecondsRemaining(0);
+      setClassroomLockActive(true);
+
+      if (headsUpAlertsEnabled) {
+        setNotification({
+          id: Date.now().toString(),
+          title: 'Classroom Shield Engaged',
+          message: `Exit cancelled. Position re-anchored inside "${zoneName}". DND remains securely active.`,
+          type: 'silent',
+        });
+      }
+
+      setActivityLogs((prev) => [
+        {
+          id: Date.now().toString(),
+          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+          type: 'enter',
+          zoneName,
+          detail: 'Indoor GPS drift absorbed: User confirmed still inside classroom perimeter',
+        },
+        ...prev.slice(0, 9),
+      ]);
+    }
+  };
+
+  // Live Exit Grace Countdown Interval Engine
+  useEffect(() => {
+    if (!exitPendingZone || !exitTargetTimeRef.current) return;
+
+    const interval = setInterval(() => {
+      if (!exitTargetTimeRef.current) return;
+      const remainingMs = exitTargetTimeRef.current - Date.now();
+      const remainingSec = Math.max(0, Math.ceil(remainingMs / 1000));
+      setExitSecondsRemaining(remainingSec);
+
+      if (remainingSec <= 0) {
+        clearInterval(interval);
+        confirmZoneExit(exitPendingZone);
+      }
+    }, 250);
+
+    return () => clearInterval(interval);
+  }, [exitPendingZone, autoDndEnabled, manualOverrideDndOff, soundFeedbackEnabled, headsUpAlertsEnabled, exitGraceSeconds]);
+
+  // Core Geofencing & Automatic DND Engine with Hysteresis & Classroom Anti-Drift Guard
   useEffect(() => {
     if (!location) return;
 
@@ -917,9 +1321,22 @@ export default function App() {
     for (const zone of zones) {
       if (!zone.enabled) continue;
       const distance = getDistance(location.lat, location.lng, zone.lat, zone.lng);
-      const isInsideGps = distance <= zone.radius;
+
+      // Hysteresis buffer: 25% extra cushion (20m - 50m) when already inside this zone
+      const isCurrentlyActiveInThisZone = activeZone?.id === zone.id || prevZoneRef.current?.id === zone.id || exitPendingZone?.id === zone.id;
+      const hysteresisBuffer = isCurrentlyActiveInThisZone ? Math.min(50, Math.max(20, zone.radius * 0.25)) : 0;
+      
+      // Accuracy cushion: account for indoor GPS uncertainty (±8m to ±30m)
+      const accuracyCushion = Math.min(location.accuracy ? location.accuracy * 0.5 : 8, 30);
+      const effectiveDistance = Math.max(0, distance - accuracyCushion);
+
+      const isInsideGps = effectiveDistance <= (zone.radius + hysteresisBuffer);
       const isInsideWifi = isWifiConnected && Boolean(zone.wifiSsid && connectedWifiSsid && zone.wifiSsid.toLowerCase() === connectedWifiSsid.toLowerCase());
-      if ((isInsideGps || isInsideWifi) && distance < minDistance) {
+      
+      // Classroom drift lock: if active and distance is within 2.5x radius, hold presence
+      const isClassroomHold = classroomLockActive && isCurrentlyActiveInThisZone && distance <= zone.radius * 2.5;
+
+      if ((isInsideGps || isInsideWifi || isClassroomHold) && distance < minDistance) {
         minDistance = distance;
         foundActiveZone = zone;
       }
@@ -929,6 +1346,13 @@ export default function App() {
 
     if (foundActiveZone) {
       // INSIDE A GEOFENCED ZONE
+      // If an exit grace countdown was active, cancel it immediately!
+      if (exitPendingZone) {
+        setExitPendingZone(null);
+        exitTargetTimeRef.current = null;
+        setExitSecondsRemaining(0);
+      }
+
       const isNewZone = previousZone?.id !== foundActiveZone.id;
       prevZoneRef.current = foundActiveZone;
       setActiveZone(foundActiveZone);
@@ -936,6 +1360,12 @@ export default function App() {
       if (isNewZone) {
         // Reset manual override whenever entering a distinct zone
         setManualOverrideDndOff(false);
+
+        // Auto-engage Classroom Anti-Drift Lock if enabled or zone is academic/quiet
+        const isAcademic = /class|lecture|room|school|college|uni|study|lib|exam|lab/i.test(foundActiveZone.name);
+        if (classroomLockEnabled || isAcademic) {
+          setClassroomLockActive(true);
+        }
 
         // If switching from another zone, finalize duration for previous zone
         if (previousZone && previousZone.id !== foundActiveZone.id) {
@@ -1004,17 +1434,21 @@ export default function App() {
             );
 
             if (!isDndActive) {
+              const zoneMode = foundActiveZone.silenceMode || defaultRadiusMode;
               setIsDndActive(true);
 
+              if (zoneMode === 'vibrate' && 'vibrate' in navigator) {
+                try { navigator.vibrate([220, 90, 220]); } catch {}
+              }
               if (soundFeedbackEnabled) {
-                playDndChime('silent');
+                playDndChime(zoneMode === 'vibrate' ? 'vibrate' : 'silent');
               }
 
               if (headsUpAlertsEnabled) {
                 setNotification({
                   id: Date.now().toString(),
-                  title: 'Do Not Disturb Turned On',
-                  message: `Entered "${foundActiveZone.name}" (${foundActiveZone.radius}m perimeter). Silent Mode activated automatically.`,
+                  title: zoneMode === 'vibrate' ? 'Vibration Mode Switched ON' : 'DND Mode Switched ON',
+                  message: `Entered "${foundActiveZone.name}" (${foundActiveZone.radius}m radius). Mobile switched to ${zoneMode === 'vibrate' ? 'Vibration Mode' : 'Do Not Disturb'}.`,
                   type: 'silent',
                 });
               }
@@ -1025,7 +1459,9 @@ export default function App() {
                   timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
                   type: 'enter',
                   zoneName: foundActiveZone.name,
-                  detail: 'Automatic DND activated upon entering perimeter (instant mode)',
+                  detail: zoneMode === 'vibrate'
+                    ? 'Automatic Vibration Mode activated upon entering Google Maps radius'
+                    : 'Automatic DND activated upon entering Google Maps radius',
                 },
                 ...prev.slice(0, 9),
               ]);
@@ -1034,9 +1470,8 @@ export default function App() {
         }
       }
     } else {
-      // OUTSIDE ALL ACTIVE ZONES -> GUARANTEED DND DEACTIVATION
-      const exitingZone = previousZone || activeZone || dwellPendingZone;
-      const exitingZoneName = exitingZone?.name || 'Silent Zone';
+      // OUTSIDE ALL ACTIVE ZONES
+      const exitingZone = previousZone || activeZone || dwellPendingZone || exitPendingZone;
 
       // Check if exiting while dwell delay was in progress (PASS-THROUGH PREVENTED)
       if (dwellPendingZone) {
@@ -1074,92 +1509,55 @@ export default function App() {
           },
           ...prev.slice(0, 9),
         ]);
+        return;
       }
 
-      // Always cleanly reset zone tracking so returning into any zone triggers fresh evaluation
-      prevZoneRef.current = null;
-      setActiveZone(null);
-      setManualOverrideDndOff(false);
+      // If we were inside an active zone and just drifted outside:
+      if (activeZone || previousZone) {
+        const zoneToVerify = activeZone || previousZone;
 
-      if (isDndActive || activeZone !== null || previousZone !== null) {
-        // Finalize duration for the zone we just exited
-        if (exitingZone) {
-          setRecentExitZone({
-            name: exitingZone.name,
-            timestamp: Date.now(),
-          });
-          setTimeout(() => setRecentExitZone(null), 4000);
-
-          const entryTime = zoneEntryTimesRef.current[exitingZone.id] || (Date.now() - 45000);
-          const elapsed = Math.max(20, Math.round((Date.now() - entryTime) / 1000));
-          delete zoneEntryTimesRef.current[exitingZone.id];
-
-          setZones((curr) =>
-            curr.map((z) =>
-              z.id === exitingZone.id
-                ? {
-                    ...z,
-                    totalDurationSeconds: (z.totalDurationSeconds ?? 0) + elapsed,
-                    lastEnteredAt: null,
-                  }
-                : z
-            )
-          );
+        // If classroom lock is on and we are within 250m, hold the zone (absorb indoor drift)
+        if (classroomLockActive && minDistance < 250) {
+          return;
         }
 
-        if (autoDndEnabled) {
-          if (quickMuteSession?.active) {
-            setIsDndActive(true);
-            setActivityLogs((prev) => [
-              {
-                id: Date.now().toString(),
-                timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
-                type: 'exit',
-                zoneName: exitingZoneName,
-                detail: `Left "${exitingZoneName}". DND remains active due to Quick Mute timer (${formatDurationRemaining(quickMuteSecondsRemaining)} remaining)`,
-              },
-              ...prev.slice(0, 9),
-            ]);
-          } else if (isScheduleActive && !manualOverrideDndOff) {
-            setIsDndActive(true);
-            setActivityLogs((prev) => [
-              {
-                id: Date.now().toString(),
-                timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
-                type: 'exit',
-                zoneName: exitingZoneName,
-                detail: `Left "${exitingZoneName}". DND remains active due to Global Schedule Override (${formatTimeTo12Hour(timeOverride.startTime)} - ${formatTimeTo12Hour(timeOverride.endTime)})`,
-              },
-              ...prev.slice(0, 9),
-            ]);
-          } else {
-            setIsDndActive(false);
+        // If exit grace period is enabled (> 0) and not yet started:
+        if (exitGraceSeconds > 0 && (!exitPendingZone || exitPendingZone.id !== zoneToVerify.id)) {
+          setExitPendingZone(zoneToVerify);
+          exitTargetTimeRef.current = Date.now() + exitGraceSeconds * 1000;
+          setExitSecondsRemaining(exitGraceSeconds);
 
-            if (soundFeedbackEnabled) {
-              playDndChime('normal');
-            }
-
-            if (headsUpAlertsEnabled) {
-              setNotification({
-                id: Date.now().toString(),
-                title: 'Normal Mode Restored',
-                message: `Left "${exitingZoneName}". Do Not Disturb turned off automatically.`,
-                type: 'normal',
-              });
-            }
-
-            setActivityLogs((prev) => [
-              {
-                id: Date.now().toString(),
-                timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
-                type: 'exit',
-                zoneName: exitingZoneName,
-                detail: 'Ringer restored automatically upon exiting perimeter',
-              },
-              ...prev.slice(0, 9),
-            ]);
+          if (headsUpAlertsEnabled) {
+            setNotification({
+              id: Date.now().toString(),
+              title: 'Verifying Zone Exit',
+              message: `GPS drifted outside "${zoneToVerify.name}". Verifying for ${exitGraceSeconds}s to protect against indoor drift. DND remains active.`,
+              type: 'silent',
+            });
           }
+
+          setActivityLogs((prev) => [
+            {
+              id: Date.now().toString(),
+              timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+              type: 'exit',
+              zoneName: zoneToVerify.name,
+              detail: `GPS coordinates fluctuated outside perimeter. Exit grace period started (${exitGraceSeconds}s verification before unmuting)`,
+            },
+            ...prev.slice(0, 9),
+          ]);
+          return; // KEEP DND ON! Do not proceed to deactivation!
         }
+
+        // If already in exit grace period and countdown hasn't finished:
+        if (exitPendingZone && exitSecondsRemaining > 0) {
+          return; // Still waiting for countdown
+        }
+      }
+
+      // If exit grace period is 0 or finished, finalize exit
+      if (exitingZone && (isDndActive || activeZone !== null || previousZone !== null)) {
+        confirmZoneExit(exitingZone);
       }
     }
   }, [
@@ -1175,6 +1573,11 @@ export default function App() {
     dwellPendingZone,
     isScheduleActive,
     timeOverride,
+    classroomLockActive,
+    classroomLockEnabled,
+    exitGraceSeconds,
+    exitPendingZone,
+    exitSecondsRemaining,
   ]);
 
   // Live Dwell Countdown Interval Engine
@@ -1210,17 +1613,21 @@ export default function App() {
             )
           );
 
+          const zoneMode = zoneToActivate.silenceMode || defaultRadiusMode;
           setIsDndActive(true);
 
+          if (zoneMode === 'vibrate' && 'vibrate' in navigator) {
+            try { navigator.vibrate([220, 90, 220]); } catch {}
+          }
           if (soundFeedbackEnabled) {
-            playDndChime('silent');
+            playDndChime(zoneMode === 'vibrate' ? 'vibrate' : 'silent');
           }
 
           if (headsUpAlertsEnabled) {
             setNotification({
               id: Date.now().toString(),
-              title: 'Do Not Disturb Turned On',
-              message: `Dwell verified (${dwellTimeSeconds}s in "${zoneToActivate.name}"). Silent Mode activated automatically.`,
+              title: zoneMode === 'vibrate' ? 'Vibration Mode Switched ON' : 'DND Mode Switched ON',
+              message: `Reached "${zoneToActivate.name}" (${dwellTimeSeconds}s dwell verified). Switched to ${zoneMode === 'vibrate' ? 'Vibration Mode' : 'Do Not Disturb'}.`,
               type: 'silent',
             });
           }
@@ -1231,7 +1638,9 @@ export default function App() {
               timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
               type: 'enter',
               zoneName: zoneToActivate.name,
-              detail: `Dwell verified (${dwellTimeSeconds}s elapsed): Automatic DND activated after remaining in perimeter`,
+              detail: zoneMode === 'vibrate'
+                ? `Dwell verified (${dwellTimeSeconds}s): Vibration Mode switched ON`
+                : `Dwell verified (${dwellTimeSeconds}s): Automatic DND switched ON`,
             },
             ...prev.slice(0, 9),
           ]);
@@ -1271,6 +1680,41 @@ export default function App() {
     }
   };
 
+  const handleUpdateExitGrace = (seconds: number) => {
+    const clamped = Math.max(0, Math.min(60, Math.round(seconds)));
+    setExitGraceSeconds(clamped);
+    try {
+      localStorage.setItem(EXIT_GRACE_STORAGE_KEY, String(clamped));
+    } catch {}
+    if (headsUpAlertsEnabled) {
+      setNotification({
+        id: Date.now().toString(),
+        title: 'Exit Grace Period Updated',
+        message: clamped === 0
+          ? 'Instant exit enabled. Unmutes immediately when leaving perimeter.'
+          : `Exit grace set to ${clamped}s. Indoor GPS drift won't accidentally unmute phone.`,
+        type: 'normal',
+      });
+    }
+  };
+
+  const handleToggleClassroomLockPref = (enabled: boolean) => {
+    setClassroomLockEnabled(enabled);
+    try {
+      localStorage.setItem(CLASSROOM_LOCK_STORAGE_KEY, String(enabled));
+    } catch {}
+    if (!enabled) {
+      setClassroomLockActive(false);
+    }
+  };
+
+  const handleToggleFilterCoarseGps = (filter: boolean) => {
+    setFilterCoarseGps(filter);
+    try {
+      localStorage.setItem(FILTER_COARSE_GPS_STORAGE_KEY, String(filter));
+    } catch {}
+  };
+
   const handleSkipDwellDelay = () => {
     if (!dwellPendingZone) return;
     const zoneToActivate = dwellPendingZone;
@@ -1292,15 +1736,19 @@ export default function App() {
       )
     );
 
+    const zoneMode = zoneToActivate.silenceMode || defaultRadiusMode;
     setIsDndActive(true);
+    if (zoneMode === 'vibrate' && 'vibrate' in navigator) {
+      try { navigator.vibrate([220, 90, 220]); } catch {}
+    }
     if (soundFeedbackEnabled) {
-      playDndChime('silent');
+      playDndChime(zoneMode === 'vibrate' ? 'vibrate' : 'silent');
     }
     if (headsUpAlertsEnabled) {
       setNotification({
         id: Date.now().toString(),
-        title: 'Do Not Disturb Turned On',
-        message: `Dwell bypassed: Silent Mode activated immediately inside "${zoneToActivate.name}".`,
+        title: zoneMode === 'vibrate' ? 'Vibration Mode Switched ON' : 'DND Mode Switched ON',
+        message: `Dwell bypassed: ${zoneMode === 'vibrate' ? 'Vibration Mode' : 'Silent Mode'} activated inside "${zoneToActivate.name}".`,
         type: 'silent',
       });
     }
@@ -1310,7 +1758,7 @@ export default function App() {
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
         type: 'enter',
         zoneName: zoneToActivate.name,
-        detail: 'Manual skip: Dwell delay bypassed by user, DND activated immediately',
+        detail: `Manual skip: ${zoneMode === 'vibrate' ? 'Vibration Mode' : 'DND'} activated immediately`,
       },
       ...prev.slice(0, 9),
     ]);
@@ -1427,13 +1875,21 @@ export default function App() {
   const handleAddZone = () => {
     if (!location || !newZoneName.trim()) return;
 
-    // Offset coordinates if "ahead" was chosen to easily test walk-in
-    const targetLat = selectedMapsPlace 
-      ? selectedMapsPlace.lat 
-      : (placementType === 'ahead' ? location.lat + 0.0022 : location.lat);
-    const targetLng = selectedMapsPlace 
-      ? selectedMapsPlace.lng 
-      : (placementType === 'ahead' ? location.lng + 0.0022 : location.lng);
+    // Use map-picked pin first, then Google Maps searched place, then placement offset
+    const targetLat = customZoneCoords
+      ? customZoneCoords.lat
+      : selectedMapsPlace
+      ? selectedMapsPlace.lat
+      : placementType === 'ahead'
+      ? location.lat + 0.0022
+      : location.lat;
+    const targetLng = customZoneCoords
+      ? customZoneCoords.lng
+      : selectedMapsPlace
+      ? selectedMapsPlace.lng
+      : placementType === 'ahead'
+      ? location.lng + 0.0022
+      : location.lng;
     
     const newZone: Zone = {
       id: Date.now().toString(),
@@ -1442,6 +1898,7 @@ export default function App() {
       lng: targetLng,
       radius: parseInt(newZoneRadius) || (selectedMapsPlace?.recommendedRadius || 100),
       enabled: true,
+      mode: selectedSmartMode,
       silenceMode: newZoneSilenceMode,
       wifiSsid: newZoneWifiSsid.trim() || undefined,
       mapsMetadata: selectedMapsPlace ? {
@@ -1462,9 +1919,19 @@ export default function App() {
     setIsAddingZone(false);
     setNewZoneName('');
     setSelectedMapsPlace(null);
-    setNewZoneSilenceMode('silent');
+    setCustomZoneCoords(null);
+    setNewZoneSilenceMode(defaultRadiusMode);
     setNewZoneWifiSsid('');
     setPlacementType('current');
+
+    if (headsUpAlertsEnabled) {
+      setNotification({
+        id: Date.now().toString(),
+        title: 'Silent Zone Added & Synced',
+        message: `"${newZone.name}" (${newZone.radius}m) saved and pushed to Android phone.`,
+        type: 'normal',
+      });
+    }
   };
 
   // Automated Quiet Zone Scanning via Google Maps Grounding as user moves
@@ -1632,19 +2099,20 @@ export default function App() {
         ...prev.slice(0, 9),
       ]);
     } else {
-      // Turn DND on
+      // Turn DND / Vibration on
+      const targetMode = activeZone?.silenceMode || defaultRadiusMode;
       setIsDndActive(true);
       setManualOverrideDndOff(false);
       if (soundFeedbackEnabled) {
-        playDndChime('silent');
+        playDndChime(targetMode === 'vibrate' ? 'vibrate' : 'silent');
       }
       if (headsUpAlertsEnabled) {
         setNotification({
           id: Date.now().toString(),
-          title: 'Do Not Disturb Turned On',
+          title: targetMode === 'vibrate' ? 'Vibration Mode Switched On' : 'Do Not Disturb Turned On',
           message: isScheduleActive 
             ? `Silent mode engaged (Overridden by Schedule ${formatTimeTo12Hour(timeOverride.startTime)} - ${formatTimeTo12Hour(timeOverride.endTime)}).` 
-            : 'Silent mode activated manually.',
+            : `${targetMode === 'vibrate' ? 'Vibration mode' : 'Silent mode'} activated manually.`,
           type: 'silent',
         });
       }
@@ -1656,7 +2124,7 @@ export default function App() {
           zoneName: isScheduleActive ? 'Global Schedule' : (activeZone?.name || 'Manual Control'),
           detail: isScheduleActive 
             ? 'DND reactivated (Schedule override resumed)' 
-            : 'DND activated manually by user',
+            : `${targetMode === 'vibrate' ? 'Vibration mode' : 'DND'} activated manually by user`,
         },
         ...prev.slice(0, 9),
       ]);
@@ -1718,10 +2186,28 @@ export default function App() {
   );
 
   return (
-    <div className="min-h-screen bg-slate-950 flex items-center justify-center p-2 sm:p-4 font-sans antialiased select-none">
-      {/* Mobile Device Mockup Container */}
-      <div className="w-full max-w-[410px] h-[860px] max-h-[96vh] bg-slate-50 rounded-[3rem] shadow-2xl overflow-hidden flex flex-col relative ring-8 ring-slate-900 border border-slate-800">
-        <AndroidStatusBar />
+    <MapsProviderWrapper>
+      <div className="min-h-screen bg-slate-950 flex flex-col items-center justify-center font-sans antialiased select-none">
+        {mapsQuotaExceeded && (
+          <div className="w-full bg-amber-50 border-b border-amber-200 text-amber-900 px-4 py-2.5 text-xs md:text-sm text-center sticky top-0 z-50 shadow-sm">
+            <span>
+              Google Maps Platform quota reached. If you are the app owner, visit{' '}
+              <a
+                href="https://developers.google.com/maps/ai/ai-studio?utm_campaign=gmp_mcp_codeassist_v1_aistudio#quota_exceeded_errors"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="underline font-semibold text-amber-950 hover:text-amber-800"
+              >
+                maps developer site
+              </a>{' '}
+              for instructions to update your account.
+            </span>
+          </div>
+        )}
+        <div className="w-full flex-1 flex items-center justify-center p-2 sm:p-4">
+          {/* Mobile Device Mockup Container */}
+          <div className="w-full max-w-[410px] h-[860px] max-h-[96vh] bg-slate-50 rounded-[3rem] shadow-2xl overflow-hidden flex flex-col relative ring-8 ring-slate-900 border border-slate-800">
+            <AndroidStatusBar />
 
         {/* Android Heads-Up Notification Banner */}
         <AnimatePresence>
@@ -1773,7 +2259,9 @@ export default function App() {
               isScheduleActive
                 ? 'bg-purple-100 text-purple-700 border border-purple-200'
                 : isDndActive 
-                ? 'bg-indigo-100 text-indigo-700' 
+                ? (activeZone?.silenceMode || defaultRadiusMode) === 'vibrate'
+                  ? 'bg-amber-100 text-amber-800 border border-amber-200'
+                  : 'bg-indigo-100 text-indigo-700'
                 : 'bg-emerald-100 text-emerald-700'
             }`}>
               {isScheduleActive ? (
@@ -1782,10 +2270,17 @@ export default function App() {
                   <span>Overridden by Schedule</span>
                 </>
               ) : isDndActive ? (
-                <>
-                  <VolumeX size={13} />
-                  <span>Silent</span>
-                </>
+                (activeZone?.silenceMode || defaultRadiusMode) === 'vibrate' ? (
+                  <>
+                    <Vibrate size={13} />
+                    <span>Vibrate</span>
+                  </>
+                ) : (
+                  <>
+                    <VolumeX size={13} />
+                    <span>DND</span>
+                  </>
+                )
               ) : (
                 <>
                   <Volume2 size={13} />
@@ -1809,40 +2304,6 @@ export default function App() {
                 exit={{ opacity: 0, x: 15 }}
                 className="p-5 flex flex-col items-center"
               >
-                {/* Physical Phone DND Hardware Bridge Banner */}
-                <button
-                  type="button"
-                  onClick={() => setIsPhoneBridgeModalOpen(true)}
-                  className="w-full mb-3 px-3 py-2 bg-gradient-to-r from-slate-900 via-indigo-950 to-slate-900 text-white rounded-2xl shadow-sm border border-slate-700/80 flex items-center justify-between text-left transition hover:border-emerald-400 active:scale-98 cursor-pointer group"
-                  title="Configure physical phone hardware DND (no 3rd party apps needed)"
-                >
-                  <div className="flex items-center gap-2.5 min-w-0">
-                    <div className={`w-7 h-7 rounded-lg flex items-center justify-center shrink-0 ${
-                      phoneBridgeConfig.enabled && phoneBridgeConfig.webhookUrl
-                        ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-400/40'
-                        : 'bg-emerald-500/20 text-emerald-300 border border-emerald-400/40'
-                    }`}>
-                      <Smartphone size={15} />
-                    </div>
-                    <div className="min-w-0">
-                      <div className="flex items-center gap-1.5 flex-wrap">
-                        <span className="text-[11px] font-bold text-white">Physical Phone DND</span>
-                        <span className="text-[9px] font-mono font-bold bg-emerald-500/20 text-emerald-300 px-1.5 py-0.2 rounded-full border border-emerald-400/30">
-                          ✨ 0 Apps Needed
-                        </span>
-                      </div>
-                      <p className="text-[10px] text-slate-300 truncate mt-0.5">
-                        {phoneBridgeConfig.enabled && phoneBridgeConfig.webhookUrl
-                          ? 'Phone hardware syncs automatically via Webhook'
-                          : 'Use your phone\'s built-in Samsung / Pixel / iOS rules'}
-                      </p>
-                    </div>
-                  </div>
-                  <span className="text-[10px] font-bold text-emerald-300 bg-white/10 px-2 py-1 rounded-lg shrink-0 ml-2 group-hover:bg-white/20 transition">
-                    Phone Setup →
-                  </span>
-                </button>
-
                 {/* Main Visual Status Orb */}
                 <div className="relative mt-3 mb-4 flex flex-col items-center">
                   {/* Expanding state change ripple wave */}
@@ -1883,17 +2344,17 @@ export default function App() {
                       isScheduleActive
                         ? 'bg-gradient-to-br from-purple-700 via-indigo-800 to-slate-900 hover:from-purple-600 hover:to-indigo-700'
                         : isDndActive 
-                        ? activeZone?.silenceMode === 'vibrate'
+                        ? (activeZone?.silenceMode || defaultRadiusMode) === 'vibrate'
                           ? 'bg-gradient-to-br from-amber-600 via-orange-700 to-slate-900 hover:from-amber-500 hover:to-orange-600'
                           : activeZone?.silenceMode === 'priority'
                           ? 'bg-gradient-to-br from-purple-600 via-indigo-700 to-slate-900 hover:from-purple-500 hover:to-indigo-600'
                           : 'bg-gradient-to-br from-indigo-600 to-indigo-800 hover:from-indigo-500 hover:to-indigo-700' 
                         : 'bg-gradient-to-br from-emerald-500 to-teal-600 hover:from-emerald-400 hover:to-teal-500'
                     }`}
-                    title="Tap to toggle Do Not Disturb manually"
+                    title="Tap to toggle Do Not Disturb / Vibration manually"
                   >
                     <motion.div
-                      key={isScheduleActive ? 'schedule' : isDndActive ? (activeZone?.silenceMode || 'silent') : 'normal'}
+                      key={isScheduleActive ? 'schedule' : isDndActive ? (activeZone?.silenceMode || defaultRadiusMode) : 'normal'}
                       initial={{ scale: 0.85, opacity: 0 }}
                       animate={{ scale: 1, opacity: 1 }}
                       transition={{ duration: 0.25 }}
@@ -1902,7 +2363,7 @@ export default function App() {
                       {isScheduleActive ? (
                         <Moon size={42} className="mb-1.5 drop-shadow text-purple-200" />
                       ) : isDndActive ? (
-                        activeZone?.silenceMode === 'vibrate' ? (
+                        (activeZone?.silenceMode || defaultRadiusMode) === 'vibrate' ? (
                           <Vibrate size={42} className="mb-1.5 drop-shadow text-amber-200 animate-pulse" />
                         ) : activeZone?.silenceMode === 'priority' ? (
                           <Star size={42} className="mb-1.5 drop-shadow text-amber-300 fill-amber-300 animate-pulse" />
@@ -1916,19 +2377,19 @@ export default function App() {
                         {isScheduleActive
                           ? 'Overridden by Schedule'
                           : isDndActive
-                          ? activeZone?.silenceMode === 'vibrate'
-                            ? 'Vibrate Only'
+                          ? (activeZone?.silenceMode || defaultRadiusMode) === 'vibrate'
+                            ? 'Vibration Mode'
                             : activeZone?.silenceMode === 'priority'
                             ? 'Priority Mode'
-                            : 'Silent Mode'
+                            : 'DND Mode'
                           : 'Normal Mode'}
                       </span>
                       <span className="text-[11px] opacity-90 font-medium leading-tight mt-0.5 max-w-[155px] text-center">
                         {isScheduleActive 
                           ? `${formatTimeTo12Hour(timeOverride.startTime)} – ${formatTimeTo12Hour(timeOverride.endTime)} • DND Locked ON` 
                           : isDndActive 
-                          ? activeZone?.silenceMode === 'vibrate'
-                            ? `Haptic alerts inside ${activeZone?.name || 'zone'}`
+                          ? (activeZone?.silenceMode || defaultRadiusMode) === 'vibrate'
+                            ? activeZone ? `Vibration ON in ${activeZone.name}` : 'Vibration ON'
                             : activeZone?.silenceMode === 'priority'
                             ? `Alarms & VIP allowed in ${activeZone?.name || 'zone'}`
                             : 'Do Not Disturb ON'
@@ -1944,6 +2405,48 @@ export default function App() {
                       ? `Quiet hours: ${formatTimeTo12Hour(timeOverride.startTime)} – ${formatTimeTo12Hour(timeOverride.endTime)}`
                       : 'Tap orb to manually toggle DND'}
                   </span>
+                </div>
+
+                {/* Radius Entry Mode Switcher (DND Mode or Vibration Mode) */}
+                <div className="w-full bg-white rounded-2xl p-3 shadow-sm border border-slate-200/90 mb-3 space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[11px] font-bold text-slate-700">
+                      On Reaching Location Radius
+                    </span>
+                    <button
+                      type="button"
+                      onClick={askDndPermissionDirect}
+                      className="text-[10px] font-bold text-indigo-600 hover:text-indigo-800 hover:underline cursor-pointer"
+                    >
+                      {inbuiltApkMode && inbuiltDndStatus?.granted ? 'OS DND Active' : 'Ask DND Access →'}
+                    </button>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => handleSelectRadiusMode('silent')}
+                      className={`py-2 px-3 rounded-xl border text-xs font-bold flex items-center justify-center gap-1.5 transition cursor-pointer ${
+                        (activeZone?.silenceMode || defaultRadiusMode) !== 'vibrate'
+                          ? 'bg-indigo-600 text-white border-indigo-600 shadow-2xs'
+                          : 'bg-slate-50 hover:bg-slate-100 text-slate-700 border-slate-200'
+                      }`}
+                    >
+                      <BellOff size={14} />
+                      DND Mode
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleSelectRadiusMode('vibrate')}
+                      className={`py-2 px-3 rounded-xl border text-xs font-bold flex items-center justify-center gap-1.5 transition cursor-pointer ${
+                        (activeZone?.silenceMode || defaultRadiusMode) === 'vibrate'
+                          ? 'bg-amber-500 text-white border-amber-500 shadow-2xs'
+                          : 'bg-slate-50 hover:bg-slate-100 text-slate-700 border-slate-200'
+                      }`}
+                    >
+                      <Vibrate size={14} />
+                      Vibration Mode
+                    </button>
+                  </div>
                 </div>
 
                 {/* ACTIVE QUICK MUTE LIVE COUNTDOWN CARD */}
@@ -2331,6 +2834,73 @@ export default function App() {
                   </motion.div>
                 )}
 
+                {/* Exit Verification Grace Period Active Banner (Indoor GPS Anti-Drift Guard) */}
+                {exitPendingZone && (
+                  <motion.div
+                    key="exit-grace-banner"
+                    initial={{ opacity: 0, y: -10, scale: 0.98 }}
+                    animate={{ opacity: 1, y: 0, scale: 1 }}
+                    exit={{ opacity: 0, y: -10, scale: 0.98 }}
+                    className="w-full bg-gradient-to-r from-amber-500/15 via-orange-500/10 to-amber-500/15 border-2 border-amber-400 rounded-2xl p-4 mb-4 shadow-md relative overflow-hidden"
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="flex items-center gap-2.5">
+                        <div className="w-10 h-10 rounded-xl bg-amber-500 text-white flex items-center justify-center shrink-0 shadow-sm animate-pulse">
+                          <AlertTriangle size={22} />
+                        </div>
+                        <div>
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            <h4 className="font-bold text-sm text-slate-900">
+                              Classroom GPS Drift Detected
+                            </h4>
+                            <span className="text-[10px] font-mono font-bold bg-amber-200 text-amber-950 px-2 py-0.5 rounded-full border border-amber-300">
+                              Unmuting in {exitSecondsRemaining}s
+                            </span>
+                          </div>
+                          <p className="text-xs text-slate-700 mt-0.5">
+                            Signal drifted outside <strong>"{exitPendingZone.name}"</strong>. DND remains locked ON during grace period.
+                          </p>
+                        </div>
+                      </div>
+
+                      <span className="text-[10px] font-bold bg-emerald-600 text-white px-2 py-0.5 rounded-md shrink-0 flex items-center gap-1">
+                        <ShieldCheck size={11} />
+                        DND PROTECTED
+                      </span>
+                    </div>
+
+                    {/* Live countdown progress */}
+                    <div className="mt-3 w-full bg-slate-200/80 rounded-full h-2 overflow-hidden">
+                      <div
+                        className="h-full bg-gradient-to-r from-amber-500 to-orange-600 rounded-full transition-all duration-200"
+                        style={{
+                          width: `${Math.min(100, Math.max(5, (exitSecondsRemaining / Math.max(1, exitGraceSeconds)) * 100))}%`
+                        }}
+                      />
+                    </div>
+
+                    <div className="mt-3 flex items-center justify-end gap-2 pt-1">
+                      <button
+                        type="button"
+                        onClick={cancelExitGrace}
+                        className="flex-1 py-2 px-3 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold rounded-xl transition flex items-center justify-center gap-1.5 shadow-2xs active:scale-95 cursor-pointer"
+                        title="Keep ringer muted and anchor position to classroom"
+                      >
+                        <ShieldCheck size={14} />
+                        I'm Still In Class (Stay Muted)
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => confirmZoneExit(exitPendingZone)}
+                        className="py-2 px-3 bg-slate-200 hover:bg-slate-300 text-slate-800 text-xs font-bold rounded-xl transition flex items-center justify-center gap-1 active:scale-95 cursor-pointer"
+                        title="Unmute ringer immediately"
+                      >
+                        Unmute Now
+                      </button>
+                    </div>
+                  </motion.div>
+                )}
+
                 {/* Manual Override Active Indicator */}
                 {manualOverrideDndOff && activeZone && (
                   <div className="w-full bg-amber-50 border border-amber-200 rounded-xl p-3 mb-3 flex items-center justify-between text-xs animate-fade-in">
@@ -2385,7 +2955,9 @@ export default function App() {
                 {/* Active Geofence Card */}
                 <div className="w-full bg-white rounded-2xl p-4 shadow-sm border border-slate-100 mb-4">
                   <div className="flex items-center justify-between mb-2.5">
-                    <h3 className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">Geofence Status</h3>
+                    <div className="flex items-center gap-2">
+                      <h3 className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">Geofence Status</h3>
+                    </div>
                     <AnimatePresence mode="wait">
                       {isScheduleActive ? (
                         <motion.span 
@@ -2490,13 +3062,27 @@ export default function App() {
                         </div>
 
                         {/* Action Controls inside the active zone card */}
-                        <div className="pt-1">
+                        <div className="pt-1 flex flex-col sm:flex-row gap-2">
+                          <button
+                            type="button"
+                            onClick={toggleClassroomLock}
+                            className={`flex-1 py-2 px-2.5 rounded-xl font-bold text-xs shadow-2xs transition flex items-center justify-center gap-1.5 active:scale-95 cursor-pointer border ${
+                              classroomLockActive
+                                ? 'bg-emerald-600 hover:bg-emerald-700 text-white border-emerald-600'
+                                : 'bg-slate-100 hover:bg-emerald-50 text-slate-700 hover:text-emerald-800 border-slate-200 hover:border-emerald-200'
+                            }`}
+                            title="Anchor your GPS location to this room while in class"
+                          >
+                            {classroomLockActive ? <Lock size={13} /> : <Unlock size={13} />}
+                            {classroomLockActive ? 'Classroom Shield ON' : 'Lock to Class (Anti-Drift)'}
+                          </button>
+
                           {dwellPendingZone ? (
                             <button
                               id="active-zone-skip-dwell-btn"
                               type="button"
                               onClick={handleSkipDwellDelay}
-                              className="w-full py-2 px-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-xs rounded-xl shadow-2xs transition flex items-center justify-center gap-1.5 active:scale-95 cursor-pointer"
+                              className="flex-1 py-2 px-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-xs rounded-xl shadow-2xs transition flex items-center justify-center gap-1.5 active:scale-95 cursor-pointer"
                               title="Skip remaining delay and mute ringer right away"
                             >
                               <Sparkles size={13} />
@@ -2507,7 +3093,7 @@ export default function App() {
                               id="active-zone-toggle-dnd-btn"
                               type="button"
                               onClick={toggleManualDnd}
-                              className="w-full py-2 px-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs rounded-xl border border-slate-200 shadow-2xs transition flex items-center justify-center gap-1.5 active:scale-95 cursor-pointer"
+                              className="flex-1 py-2 px-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs rounded-xl border border-slate-200 shadow-2xs transition flex items-center justify-center gap-1.5 active:scale-95 cursor-pointer"
                               title="Override and toggle DND state"
                             >
                               {isDndActive ? <Bell size={13} /> : <BellOff size={13} />}
@@ -2807,6 +3393,12 @@ export default function App() {
                       onToggleManualDnd={toggleManualDnd}
                       manualOverrideActive={manualOverrideDndOff}
                       onOpenDiscovery={() => setActiveTab('discover')}
+                      classroomLockActive={classroomLockActive}
+                      onToggleClassroomLock={toggleClassroomLock}
+                      exitPendingZone={exitPendingZone}
+                      exitSecondsRemaining={exitSecondsRemaining}
+                      onCancelExitGrace={cancelExitGrace}
+                      onConfirmImmediateExit={() => exitPendingZone && confirmZoneExit(exitPendingZone)}
                     />
 
                     {/* DYNAMIC PROXIMITY & SORTING CONTROLS */}
@@ -3287,30 +3879,50 @@ export default function App() {
                 className="absolute inset-0 bg-slate-50 z-30 flex flex-col"
               >
                 <header className="bg-white px-4 py-3.5 shadow-sm flex items-center gap-3 border-b border-slate-100">
-                  <button onClick={() => setIsAddingZone(false)} className="p-1.5 -ml-1 text-slate-600 hover:bg-slate-100 rounded-full transition">
+                  <button onClick={() => { setIsAddingZone(false); setCustomZoneCoords(null); }} className="p-1.5 -ml-1 text-slate-600 hover:bg-slate-100 rounded-full transition">
                     <ChevronLeft size={22} />
                   </button>
                   <h2 className="text-base font-bold text-slate-900">Add Silent Zone</h2>
                 </header>
                 
                 <div className="p-5 flex-1 overflow-y-auto space-y-5">
-                  {/* Radar Preview */}
-                  <div className="w-full h-40 bg-slate-200 rounded-2xl relative overflow-hidden flex items-center justify-center border-2 border-indigo-200">
-                    <div className="absolute inset-0 opacity-20" style={{ backgroundImage: 'radial-gradient(#4f46e5 1px, transparent 1px)', backgroundSize: '18px 18px' }} />
-                    <div className="relative flex flex-col items-center">
-                      <MapPin size={36} className="text-indigo-600 mb-1 drop-shadow" />
-                      <div className="w-28 h-28 border-2 border-indigo-500 bg-indigo-500/20 rounded-full absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 mt-2 animate-ping opacity-30" />
-                    </div>
-                    <div className="absolute bottom-2.5 left-0 right-0 text-center px-2">
-                      <span className="bg-white/95 backdrop-blur px-3 py-1 rounded-full text-[11px] font-bold text-slate-700 shadow-sm border border-slate-100 truncate inline-block max-w-[90%]">
-                        {selectedMapsPlace
-                          ? `Grounded: ${selectedMapsPlace.name} (${selectedMapsPlace.lat.toFixed(4)}°, ${selectedMapsPlace.lng.toFixed(4)}°)`
-                          : placementType === 'current'
-                          ? 'Automatic DND at Current Location'
-                          : 'Automatic DND ~200m Ahead'}
-                      </span>
-                    </div>
-                  </div>
+                  {/* Interactive Google Maps Geofence Picker & Radius Preview */}
+                  <GeofencePickerMap
+                    centerLat={
+                      customZoneCoords
+                        ? customZoneCoords.lat
+                        : selectedMapsPlace
+                        ? selectedMapsPlace.lat
+                        : placementType === 'ahead'
+                        ? (location?.lat ?? 37.775) + 0.0022
+                        : location?.lat ?? 37.775
+                    }
+                    centerLng={
+                      customZoneCoords
+                        ? customZoneCoords.lng
+                        : selectedMapsPlace
+                        ? selectedMapsPlace.lng
+                        : placementType === 'ahead'
+                        ? (location?.lng ?? -122.4194) + 0.0022
+                        : location?.lng ?? -122.4194
+                    }
+                    radius={parseInt(newZoneRadius, 10) || 100}
+                    userLat={location?.lat}
+                    userLng={location?.lng}
+                    mapTheme={mapTheme}
+                    interactive={true}
+                    onPickCoordinates={(lat, lng) => setCustomZoneCoords({ lat, lng })}
+                    heightClassName="h-44"
+                    label={
+                      customZoneCoords
+                        ? `Pinned on Map (${customZoneCoords.lat.toFixed(4)}°, ${customZoneCoords.lng.toFixed(4)}°)`
+                        : selectedMapsPlace
+                        ? `Grounded: ${selectedMapsPlace.name} (${selectedMapsPlace.lat.toFixed(4)}°, ${selectedMapsPlace.lng.toFixed(4)}°)`
+                        : placementType === 'current'
+                        ? 'Tap map to move pin • Current Location'
+                        : 'Tap map to move pin • ~200m Ahead'
+                    }
+                  />
 
                   {/* Google Maps Place Search & Grounding Autocomplete */}
                   <div className="bg-gradient-to-br from-indigo-50/70 via-white to-indigo-50/40 border border-indigo-200/90 rounded-2xl p-3.5 space-y-2.5 shadow-2xs">
@@ -3329,6 +3941,7 @@ export default function App() {
                       placeholder="Search library, clinic, hospital, theater on Google Maps..."
                       onSelectPlace={(place) => {
                         setSelectedMapsPlace(place);
+                        setCustomZoneCoords(null);
                         setNewZoneName(place.name);
                         if (place.recommendedRadius) {
                           setNewZoneRadius(String(place.recommendedRadius));
@@ -3481,8 +4094,8 @@ export default function App() {
                     <div className="grid grid-cols-2 gap-2">
                       <button
                         type="button"
-                        onClick={() => setPlacementType('current')}
-                        className={`p-3 rounded-xl border text-left transition ${placementType === 'current' ? 'bg-indigo-50/80 border-indigo-600 text-indigo-900' : 'bg-white border-slate-200 text-slate-700'}`}
+                        onClick={() => { setPlacementType('current'); setCustomZoneCoords(null); }}
+                        className={`p-3 rounded-xl border text-left transition ${placementType === 'current' && !customZoneCoords ? 'bg-indigo-50/80 border-indigo-600 text-indigo-900' : 'bg-white border-slate-200 text-slate-700'}`}
                       >
                         <p className="font-bold text-xs flex items-center gap-1">
                           <MapPin size={12} className="text-indigo-600" />
@@ -3492,8 +4105,8 @@ export default function App() {
                       </button>
                       <button
                         type="button"
-                        onClick={() => setPlacementType('ahead')}
-                        className={`p-3 rounded-xl border text-left transition ${placementType === 'ahead' ? 'bg-indigo-50/80 border-indigo-600 text-indigo-900' : 'bg-white border-slate-200 text-slate-700'}`}
+                        onClick={() => { setPlacementType('ahead'); setCustomZoneCoords(null); }}
+                        className={`p-3 rounded-xl border text-left transition ${placementType === 'ahead' && !customZoneCoords ? 'bg-indigo-50/80 border-indigo-600 text-indigo-900' : 'bg-white border-slate-200 text-slate-700'}`}
                       >
                         <p className="font-bold text-xs flex items-center gap-1">
                           <Footprints size={12} className="text-indigo-600" />
@@ -3504,11 +4117,46 @@ export default function App() {
                     </div>
                   </div>
                   
+                  {/* Smart Modes Selector (College, Library, Hospital, Meeting, Custom) */}
+                  <SmartModesSelector
+                    selectedMode={selectedSmartMode}
+                    onSelectMode={(mode, suggestedRadius) => {
+                      setSelectedSmartMode(mode);
+                      setNewZoneRadius(String(suggestedRadius));
+                      const preset = SMART_MODE_PRESETS.find(p => p.id === mode);
+                      if (preset) {
+                        setNewZoneSilenceMode(preset.silenceMode);
+                        if (!newZoneName) {
+                          setNewZoneName(preset.name.replace(' Mode', ''));
+                        }
+                      }
+                    }}
+                  />
+
                   <div>
                     <div className="flex justify-between items-center mb-1.5">
                       <label className="text-xs font-bold text-slate-700 uppercase tracking-wider">Perimeter Radius</label>
                       <span className="text-xs font-mono font-bold text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded">{newZoneRadius} meters</span>
                     </div>
+
+                    {/* Quick Radius Selection (50m, 100m, 200m, 500m) */}
+                    <div className="grid grid-cols-4 gap-1.5 mb-2.5">
+                      {[50, 100, 200, 500].map((rad) => (
+                        <button
+                          key={rad}
+                          type="button"
+                          onClick={() => setNewZoneRadius(String(rad))}
+                          className={`py-1.5 rounded-xl text-xs font-bold font-mono transition cursor-pointer border ${
+                            parseInt(newZoneRadius, 10) === rad
+                              ? 'bg-indigo-600 text-white border-indigo-600 shadow-2xs'
+                              : 'bg-white hover:bg-slate-100 text-slate-700 border-slate-200'
+                          }`}
+                        >
+                          {rad}m
+                        </button>
+                      ))}
+                    </div>
+
                     <input 
                       type="range" 
                       min="50" max="600" step="25"
@@ -3710,18 +4358,153 @@ export default function App() {
                   </button>
                 </div>
 
+                {/* Indoor Classroom Anti-Drift Guard Card */}
+                <div className="bg-white rounded-2xl p-4 shadow-sm border border-slate-100 space-y-3.5">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2.5">
+                      <div className="w-8 h-8 rounded-xl bg-emerald-100 text-emerald-700 flex items-center justify-center">
+                        <ShieldCheck size={18} />
+                      </div>
+                      <div>
+                        <h3 className="text-sm font-bold text-slate-800">Classroom Anti-Drift Guard</h3>
+                        <p className="text-xs text-slate-500">Prevent indoor GPS jumps from unmuting DND</p>
+                      </div>
+                    </div>
+                    <span className="text-[10px] font-mono px-2 py-0.5 rounded-full font-bold bg-emerald-50 text-emerald-800 border border-emerald-200">
+                      ANTI-DRIFT ON
+                    </span>
+                  </div>
+
+                  <p className="text-xs text-slate-600 leading-relaxed">
+                    Classrooms, lecture halls, and concrete buildings cause GPS multipath bounce and sudden coordinate jumps outside the radius. These shields keep your ringer silent and prevent accidental unmutes.
+                  </p>
+
+                  {/* Toggle 1: Classroom Drift Lock */}
+                  <div className="flex items-center justify-between pt-2 border-t border-slate-100">
+                    <div>
+                      <p className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                        <Lock size={12} className="text-emerald-600" />
+                        Classroom Coordinate Anchor
+                      </p>
+                      <p className="text-[11px] text-slate-500">
+                        Locks coordinates to classroom center when inside to absorb indoor jitter
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => handleToggleClassroomLockPref(!classroomLockEnabled)}
+                      className={`w-11 h-6 rounded-full transition-colors relative cursor-pointer ${
+                        classroomLockEnabled ? 'bg-emerald-600' : 'bg-slate-300'
+                      }`}
+                    >
+                      <motion.div
+                        layout
+                        className={`w-4 h-4 bg-white rounded-full absolute top-1 ${
+                          classroomLockEnabled ? 'right-1' : 'left-1'
+                        }`}
+                      />
+                    </button>
+                  </div>
+
+                  {/* Slider: Exit Verification Grace Period */}
+                  <div className="bg-slate-50 rounded-xl p-3 border border-slate-200/70 space-y-2">
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="font-semibold text-slate-700">Exit Verification Grace Period</span>
+                      <span className="font-mono font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200">
+                        {exitGraceSeconds === 0 ? '0s (Instant Unmute)' : `${exitGraceSeconds}s Grace`}
+                      </span>
+                    </div>
+
+                    <input
+                      type="range"
+                      min="0"
+                      max="60"
+                      step="5"
+                      value={exitGraceSeconds}
+                      onChange={(e) => handleUpdateExitGrace(parseInt(e.target.value, 10) || 0)}
+                      className="w-full accent-emerald-600 h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer"
+                    />
+
+                    <div className="flex justify-between text-[10px] text-slate-400 font-medium">
+                      <span>0s (Instant)</span>
+                      <span>15s</span>
+                      <span>25s (Recommended)</span>
+                      <span>60s</span>
+                    </div>
+
+                    {/* Presets */}
+                    <div className="grid grid-cols-4 gap-1.5 pt-1">
+                      {[
+                        { label: 'Instant', value: 0 },
+                        { label: '15s', value: 15 },
+                        { label: '25s (Rec)', value: 25 },
+                        { label: '45s', value: 45 },
+                      ].map((p) => (
+                        <button
+                          key={p.value}
+                          type="button"
+                          onClick={() => handleUpdateExitGrace(p.value)}
+                          className={`py-1 text-[11px] font-bold rounded-lg border transition cursor-pointer ${
+                            exitGraceSeconds === p.value
+                              ? 'bg-emerald-600 text-white border-emerald-600 shadow-2xs'
+                              : 'bg-white hover:bg-slate-100 text-slate-700 border-slate-200'
+                          }`}
+                        >
+                          {p.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Toggle 3: Filter Coarse Indoor Fixes */}
+                  <div className="flex items-center justify-between pt-2 border-t border-slate-100">
+                    <div>
+                      <p className="text-xs font-bold text-slate-800">Filter Inaccurate GPS Fixes (&gt;65m)</p>
+                      <p className="text-[11px] text-slate-500">
+                        Discards wildly inaccurate cell tower fixes when inside lecture halls
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => handleToggleFilterCoarseGps(!filterCoarseGps)}
+                      className={`w-11 h-6 rounded-full transition-colors relative cursor-pointer ${
+                        filterCoarseGps ? 'bg-emerald-600' : 'bg-slate-300'
+                      }`}
+                    >
+                      <motion.div
+                        layout
+                        className={`w-4 h-4 bg-white rounded-full absolute top-1 ${
+                          filterCoarseGps ? 'right-1' : 'left-1'
+                        }`}
+                      />
+                    </button>
+                  </div>
+                </div>
+
                 {/* Emergency VIP Breakthrough & Repeat Callers Card */}
                 <EmergencyBypassCard
                   config={emergencyConfig}
                   onChange={handleUpdateEmergencyConfig}
                   onSimulateCall={triggerSimulateCall}
+                  isInbuiltApk={inbuiltApkMode}
+                  emergencyCallGranted={Boolean(inbuiltDndStatus?.emergencyCallGranted)}
+                  onRequestEmergencyPermission={() => {
+                    requestInbuiltEmergencyCallPermissions();
+                    setTimeout(() => setInbuiltDndStatus(getInbuiltDndStatus()), 400);
+                  }}
                 />
 
-                {/* Physical Phone Hardware Bridge & Android Settings */}
+                {/* Built-in Phone DND & Vibration Controls */}
                 <PhoneHardwareCard
                   config={phoneBridgeConfig}
                   onOpenModal={() => setIsPhoneBridgeModalOpen(true)}
-                  onTestBridge={(turnOn) => triggerPhoneHardwareSync(turnOn, 'Settings Test', 'silent')}
+                  onTestBridge={(turnOn, mode) => triggerPhoneHardwareSync(turnOn, 'Settings Test', mode || defaultRadiusMode)}
+                  isInbuiltApk={inbuiltApkMode}
+                  inbuiltDndStatus={inbuiltDndStatus}
+                  onRequestInbuiltDndPermission={() => {
+                    requestInbuiltDndPermission();
+                    setTimeout(() => setInbuiltDndStatus(getInbuiltDndStatus()), 300);
+                  }}
                 />
 
                 {/* Backup & Data Card */}
@@ -3854,6 +4637,7 @@ export default function App() {
           isOpen={!!editingRadiusZone}
           zone={editingRadiusZone ? sortedZones.find((z) => z.id === editingRadiusZone.id) || editingRadiusZone : null}
           userLocation={location}
+          mapTheme={mapTheme}
           onClose={() => setEditingRadiusZone(null)}
           onSave={handleUpdateZoneRadius}
         />
@@ -3906,15 +4690,23 @@ export default function App() {
           }}
         />
 
-        {/* Physical Phone Hardware Bridge Modal */}
+        {/* Built-in Phone Hardware Bridge Modal */}
         <PhoneHardwareBridgeModal
           isOpen={isPhoneBridgeModalOpen}
           onClose={() => setIsPhoneBridgeModalOpen(false)}
           config={phoneBridgeConfig}
           onSaveConfig={handleSavePhoneBridgeConfig}
-          onTestBridge={(turnOn) => triggerPhoneHardwareSync(turnOn, 'Modal Test', 'silent')}
+          onTestBridge={(turnOn) => triggerPhoneHardwareSync(turnOn, 'Modal Test', defaultRadiusMode)}
+          isInbuiltApk={inbuiltApkMode}
+          inbuiltDndStatus={inbuiltDndStatus}
+          onRequestInbuiltDndPermission={() => {
+            requestInbuiltDndPermission();
+            setTimeout(() => setInbuiltDndStatus(getInbuiltDndStatus()), 300);
+          }}
         />
+          </div>
+        </div>
       </div>
-    </div>
+    </MapsProviderWrapper>
   );
 }

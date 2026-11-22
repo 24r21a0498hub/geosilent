@@ -1,0 +1,145 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global Safety Net: default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidDevice(data, deviceId) {
+      return data.keys().hasAll(['deviceId', 'pairingCode', 'connected'])
+        && data.keys().hasOnly([
+          'deviceId', 'deviceName', 'pairingCode', 'connected', 'lastHeartbeat',
+          'dndActive', 'interruptionFilter', 'permissionDndGranted',
+          'permissionBackgroundLocation', 'batteryLevel', 'currentLatitude',
+          'currentLongitude', 'activeZoneName', 'appVersion', 'monitoringEnabled', 'updatedAt'
+        ])
+        && data.deviceId == deviceId
+        && isValidId(data.deviceId)
+        && data.pairingCode is string && data.pairingCode.size() > 0 && data.pairingCode.size() <= 32
+        && data.connected is bool
+        && (!('deviceName' in data) || (data.deviceName is string && data.deviceName.size() <= 128))
+        && (!('lastHeartbeat' in data) || data.lastHeartbeat is number)
+        && (!('dndActive' in data) || data.dndActive is bool)
+        && (!('interruptionFilter' in data) || (data.interruptionFilter is string && data.interruptionFilter.size() <= 64))
+        && (!('permissionDndGranted' in data) || data.permissionDndGranted is bool)
+        && (!('permissionBackgroundLocation' in data) || data.permissionBackgroundLocation is bool)
+        && (!('batteryLevel' in data) || data.batteryLevel is number)
+        && (!('currentLatitude' in data) || data.currentLatitude is number)
+        && (!('currentLongitude' in data) || data.currentLongitude is number)
+        && (!('activeZoneName' in data) || (data.activeZoneName is string && data.activeZoneName.size() <= 128))
+        && (!('appVersion' in data) || (data.appVersion is string && data.appVersion.size() <= 32))
+        && (!('monitoringEnabled' in data) || data.monitoringEnabled is bool)
+        && (!('updatedAt' in data) || (data.updatedAt is string && data.updatedAt.size() <= 64));
+    }
+
+    function isValidZone(data, deviceId, zoneId) {
+      return data.keys().hasAll(['id', 'deviceId', 'name', 'lat', 'lng', 'radius'])
+        && data.keys().hasOnly([
+          'id', 'deviceId', 'name', 'lat', 'lng', 'radius',
+          'mode', 'enabled', 'createdAt', 'updatedAt'
+        ])
+        && data.id == zoneId
+        && data.deviceId == deviceId
+        && isValidId(data.id)
+        && isValidId(data.deviceId)
+        && data.name is string && data.name.size() > 0 && data.name.size() <= 128
+        && data.lat is number && data.lat >= -90 && data.lat <= 90
+        && data.lng is number && data.lng >= -180 && data.lng <= 180
+        && data.radius is number && data.radius >= 10 && data.radius <= 10000
+        && (!('mode' in data) || (data.mode is string && data.mode.size() <= 32))
+        && (!('enabled' in data) || data.enabled is bool)
+        && (!('createdAt' in data) || (data.createdAt is string && data.createdAt.size() <= 64))
+        && (!('updatedAt' in data) || (data.updatedAt is string && data.updatedAt.size() <= 64));
+    }
+
+    function isValidPreferences(data, deviceId) {
+      return data.keys().hasAll(['deviceId', 'autoDndEnabled'])
+        && data.keys().hasOnly([
+          'deviceId', 'autoDndEnabled', 'exitGraceSeconds', 'dwellTimeSeconds',
+          'classroomLockEnabled', 'soundFeedbackEnabled', 'headsUpAlertsEnabled',
+          'filterCoarseGps', 'updatedAt'
+        ])
+        && data.deviceId == deviceId
+        && isValidId(data.deviceId)
+        && data.autoDndEnabled is bool
+        && (!('exitGraceSeconds' in data) || data.exitGraceSeconds is number)
+        && (!('dwellTimeSeconds' in data) || data.dwellTimeSeconds is number)
+        && (!('classroomLockEnabled' in data) || data.classroomLockEnabled is bool)
+        && (!('soundFeedbackEnabled' in data) || data.soundFeedbackEnabled is bool)
+        && (!('headsUpAlertsEnabled' in data) || data.headsUpAlertsEnabled is bool)
+        && (!('filterCoarseGps' in data) || data.filterCoarseGps is bool)
+        && (!('updatedAt' in data) || (data.updatedAt is string && data.updatedAt.size() <= 64));
+    }
+
+    function isValidActivityLog(data, deviceId, logId) {
+      return data.keys().hasAll(['id', 'deviceId', 'type', 'zoneName'])
+        && data.keys().hasOnly(['id', 'deviceId', 'type', 'zoneName', 'detail', 'timestamp'])
+        && data.id == logId
+        && data.deviceId == deviceId
+        && isValidId(data.id)
+        && isValidId(data.deviceId)
+        && data.type is string && data.type.size() <= 32
+        && data.zoneName is string && data.zoneName.size() <= 128
+        && (!('detail' in data) || (data.detail is string && data.detail.size() <= 256))
+        && (!('timestamp' in data) || (data.timestamp is string && data.timestamp.size() <= 64));
+    }
+
+    // Devices collection & pairing (capability-scoped by unique pairing deviceId)
+    match /devices/{deviceId} {
+      allow get: if isValidId(deviceId);
+      allow list: if false;
+      allow create: if isValidId(deviceId) && isValidDevice(incoming(), deviceId);
+      allow update: if isValidId(deviceId)
+        && isValidDevice(incoming(), deviceId)
+        && incoming().deviceId == existing().deviceId
+        && incoming().pairingCode == existing().pairingCode;
+      allow delete: if isValidId(deviceId);
+
+      // Zones subcollection
+      match /zones/{zoneId} {
+        allow get: if isValidId(deviceId) && isValidId(zoneId);
+        allow list: if isValidId(deviceId) && resource.data.deviceId == deviceId;
+        allow create: if isValidId(deviceId) && isValidId(zoneId) && isValidZone(incoming(), deviceId, zoneId);
+        allow update: if isValidId(deviceId)
+          && isValidId(zoneId)
+          && isValidZone(incoming(), deviceId, zoneId)
+          && incoming().id == existing().id
+          && incoming().deviceId == existing().deviceId;
+        allow delete: if isValidId(deviceId) && isValidId(zoneId);
+      }
+
+      // Preferences subcollection
+      match /preferences/{prefId} {
+        allow get: if isValidId(deviceId) && isValidId(prefId);
+        allow list: if isValidId(deviceId) && resource.data.deviceId == deviceId;
+        allow create: if isValidId(deviceId) && isValidId(prefId) && isValidPreferences(incoming(), deviceId);
+        allow update: if isValidId(deviceId)
+          && isValidId(prefId)
+          && isValidPreferences(incoming(), deviceId)
+          && incoming().deviceId == existing().deviceId;
+        allow delete: if isValidId(deviceId) && isValidId(prefId);
+      }
+
+      // Activity logs subcollection
+      match /activity/{logId} {
+        allow get: if isValidId(deviceId) && isValidId(logId);
+        allow list: if isValidId(deviceId) && resource.data.deviceId == deviceId;
+        allow create: if isValidId(deviceId) && isValidId(logId) && isValidActivityLog(incoming(), deviceId, logId);
+        allow update, delete: if false;
+      }
+    }
+  }
+}

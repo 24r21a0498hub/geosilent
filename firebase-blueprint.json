@@ -1,0 +1,95 @@
+{
+  "entities": {
+    "Device": {
+      "title": "Device",
+      "description": "Registered Android companion device status and telemetry",
+      "type": "object",
+      "properties": {
+        "deviceId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "deviceName": { "type": "string", "maxLength": 128 },
+        "pairingCode": { "type": "string", "maxLength": 32 },
+        "connected": { "type": "boolean" },
+        "lastHeartbeat": { "type": "number" },
+        "dndActive": { "type": "boolean" },
+        "interruptionFilter": { "type": "string", "maxLength": 64 },
+        "permissionDndGranted": { "type": "boolean" },
+        "permissionBackgroundLocation": { "type": "boolean" },
+        "batteryLevel": { "type": "number" },
+        "currentLatitude": { "type": "number" },
+        "currentLongitude": { "type": "number" },
+        "activeZoneName": { "type": "string", "maxLength": 128 },
+        "appVersion": { "type": "string", "maxLength": 32 },
+        "monitoringEnabled": { "type": "boolean" },
+        "updatedAt": { "type": "string", "maxLength": 64 }
+      },
+      "required": ["deviceId", "pairingCode", "connected"]
+    },
+    "SilentZone": {
+      "title": "SilentZone",
+      "description": "Geofenced quiet zone synchronized across Web and Android",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "deviceId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "name": { "type": "string", "maxLength": 128 },
+        "lat": { "type": "number" },
+        "lng": { "type": "number" },
+        "radius": { "type": "number" },
+        "mode": { "type": "string", "maxLength": 32 },
+        "enabled": { "type": "boolean" },
+        "createdAt": { "type": "string", "maxLength": 64 },
+        "updatedAt": { "type": "string", "maxLength": 64 }
+      },
+      "required": ["id", "deviceId", "name", "lat", "lng", "radius"]
+    },
+    "UserPreferences": {
+      "title": "UserPreferences",
+      "description": "User automation preferences synced to Android device",
+      "type": "object",
+      "properties": {
+        "deviceId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "autoDndEnabled": { "type": "boolean" },
+        "exitGraceSeconds": { "type": "number" },
+        "dwellTimeSeconds": { "type": "number" },
+        "classroomLockEnabled": { "type": "boolean" },
+        "soundFeedbackEnabled": { "type": "boolean" },
+        "headsUpAlertsEnabled": { "type": "boolean" },
+        "filterCoarseGps": { "type": "boolean" },
+        "updatedAt": { "type": "string", "maxLength": 64 }
+      },
+      "required": ["deviceId", "autoDndEnabled"]
+    },
+    "ActivityLog": {
+      "title": "ActivityLog",
+      "description": "Event log for zone entries, exits and native DND triggers",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "deviceId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "type": { "type": "string", "maxLength": 32 },
+        "zoneName": { "type": "string", "maxLength": 128 },
+        "detail": { "type": "string", "maxLength": 256 },
+        "timestamp": { "type": "string", "maxLength": 64 }
+      },
+      "required": ["id", "deviceId", "type", "zoneName"]
+    }
+  },
+  "firestore": {
+    "/devices/{deviceId}": {
+      "schema": "Device",
+      "description": "Device pairing, connection heartbeat, and live Android DND status"
+    },
+    "/devices/{deviceId}/zones/{zoneId}": {
+      "schema": "SilentZone",
+      "description": "Geofenced quiet zones for this device"
+    },
+    "/devices/{deviceId}/preferences/{prefId}": {
+      "schema": "UserPreferences",
+      "description": "Device-specific automation preferences"
+    },
+    "/devices/{deviceId}/activity/{logId}": {
+      "schema": "ActivityLog",
+      "description": "Device activity log history"
+    }
+  }
+}

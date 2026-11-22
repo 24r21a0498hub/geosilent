@@ -1,5 +1,7 @@
 import express from 'express';
 import { GoogleGenAI } from '@google/genai';
+import fs from 'fs';
+import zlib from 'zlib';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
@@ -443,6 +445,132 @@ Return ONLY a valid JSON array matching this exact format:
     }
     const fallbackPlaces = generateDynamicFallbackPlaces(centerLat, centerLng);
     return res.json({ places: fallbackPlaces, source: 'resilient_fallback' });
+  }
+});
+
+// Runtime Maps JS API key lookup fallback (client-restricted browser key)
+app.get('/api/maps/js-config', (_req, res) => {
+  const apiKey = process.env.VITE_GOOGLE_MAPS_API_KEY || process.env.GOOGLE_MAPS_API_KEY || '';
+  res.json({ apiKey });
+});
+
+// Pure Node CRC32 + ZIP generator for exporting the standalone /android APK project
+const CRC32_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let k = 0; k < 8; k++) {
+      c = (c & 1) !== 0 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    }
+    table[i] = c >>> 0;
+  }
+  return table;
+})();
+
+function computeCrc32(buf: Buffer): number {
+  let crc = 0xffffffff;
+  for (let i = 0; i < buf.length; i++) {
+    crc = CRC32_TABLE[(crc ^ buf[i]) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function collectDirectoryFiles(dirPath: string, prefix = ''): Array<{ name: string; data: Buffer }> {
+  const results: Array<{ name: string; data: Buffer }> = [];
+  if (!fs.existsSync(dirPath)) return results;
+
+  const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+  for (const entry of entries) {
+    if (entry.name === '.gradle' || entry.name === 'build' || entry.name === '.idea') continue;
+    const fullPath = path.join(dirPath, entry.name);
+    const relPath = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) {
+      results.push(...collectDirectoryFiles(fullPath, relPath));
+    } else if (entry.isFile()) {
+      results.push({ name: relPath, data: fs.readFileSync(fullPath) });
+    }
+  }
+  return results;
+}
+
+function buildZipBuffer(entries: Array<{ name: string; data: Buffer }>): Buffer {
+  const localParts: Buffer[] = [];
+  const centralParts: Buffer[] = [];
+  let offset = 0;
+
+  for (const entry of entries) {
+    const fileNameBuf = Buffer.from(entry.name, 'utf8');
+    const compressed = zlib.deflateRawSync(entry.data);
+    const crc = computeCrc32(entry.data);
+
+    const localHeader = Buffer.alloc(30);
+    localHeader.writeUInt32LE(0x04034b50, 0);
+    localHeader.writeUInt16LE(20, 4);
+    localHeader.writeUInt16LE(0x0800, 6);
+    localHeader.writeUInt16LE(8, 8);
+    localHeader.writeUInt16LE(0, 10);
+    localHeader.writeUInt16LE(0x5421, 12);
+    localHeader.writeUInt32LE(crc, 14);
+    localHeader.writeUInt32LE(compressed.length, 18);
+    localHeader.writeUInt32LE(entry.data.length, 22);
+    localHeader.writeUInt16LE(fileNameBuf.length, 26);
+    localHeader.writeUInt16LE(0, 28);
+
+    localParts.push(localHeader, fileNameBuf, compressed);
+
+    const centralHeader = Buffer.alloc(46);
+    centralHeader.writeUInt32LE(0x02014b50, 0);
+    centralHeader.writeUInt16LE(20, 4);
+    centralHeader.writeUInt16LE(20, 6);
+    centralHeader.writeUInt16LE(0x0800, 8);
+    centralHeader.writeUInt16LE(8, 10);
+    centralHeader.writeUInt16LE(0, 12);
+    centralHeader.writeUInt16LE(0x5421, 14);
+    centralHeader.writeUInt32LE(crc, 16);
+    centralHeader.writeUInt32LE(compressed.length, 20);
+    centralHeader.writeUInt32LE(entry.data.length, 24);
+    centralHeader.writeUInt16LE(fileNameBuf.length, 28);
+    centralHeader.writeUInt16LE(0, 30);
+    centralHeader.writeUInt16LE(0, 32);
+    centralHeader.writeUInt16LE(0, 34);
+    centralHeader.writeUInt16LE(0, 36);
+    centralHeader.writeUInt32LE(0, 38);
+    centralHeader.writeUInt32LE(offset, 42);
+
+    centralParts.push(centralHeader, fileNameBuf);
+    offset += localHeader.length + fileNameBuf.length + compressed.length;
+  }
+
+  const centralDirBuf = Buffer.concat(centralParts);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(0, 4);
+  eocd.writeUInt16LE(0, 6);
+  eocd.writeUInt16LE(entries.length, 8);
+  eocd.writeUInt16LE(entries.length, 10);
+  eocd.writeUInt32LE(centralDirBuf.length, 12);
+  eocd.writeUInt32LE(offset, 16);
+  eocd.writeUInt16LE(0, 20);
+
+  return Buffer.concat([...localParts, centralDirBuf, eocd]);
+}
+
+// Downloadable Android Studio / Gradle APK Source Archive (includes inbuilt DND bridge + CI workflow)
+app.get('/api/android/project.zip', (_req, res) => {
+  try {
+    const androidDir = path.resolve(__dirname, 'android');
+    const files = collectDirectoryFiles(androidDir, 'SmartSilentZone-Android');
+    if (files.length === 0) {
+      return res.status(404).json({ error: 'Android project directory not found' });
+    }
+    const zipBuffer = buildZipBuffer(files);
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', 'attachment; filename="SmartSilentZone-Android-APK-Project.zip"');
+    res.setHeader('Content-Length', String(zipBuffer.length));
+    return res.send(zipBuffer);
+  } catch (err) {
+    console.error('Failed to bundle Android project ZIP:', err);
+    return res.status(500).json({ error: 'Failed to export Android project archive' });
   }
 });
 

@@ -12,13 +12,16 @@ export interface MapsGroundingMetadata {
 
 export type SilenceMode = 'silent' | 'vibrate' | 'priority';
 
+export type SmartZoneMode = 'college' | 'library' | 'hospital' | 'meeting' | 'custom';
+
 export type Zone = {
   id: string;
   name: string;
   lat: number;
   lng: number;
-  radius: number; // in meters
+  radius: number; // in meters (presets: 50, 100, 200, 500)
   enabled: boolean;
+  mode?: SmartZoneMode;
   icon?: string;
   silenceMode?: SilenceMode; // 'silent' (total silence), 'vibrate' (vibrate only), or 'priority' (alarms/vip only)
   wifiSsid?: string; // Optional WiFi SSID beacon pairing for indoor geofencing
@@ -103,3 +106,35 @@ export interface PhoneBridgeConfig {
   vibratePhone: boolean;
   notifyOnSync: boolean;
 }
+
+export type AndroidInterruptionFilter = 'ALL' | 'PRIORITY' | 'NONE' | 'ALARMS' | 'UNKNOWN';
+
+export interface AndroidCompanionDevice {
+  deviceId: string;
+  deviceName: string;
+  pairingCode: string;
+  connected: boolean;
+  lastHeartbeat: number;
+  dndActive: boolean; // Confirmed by Android OS NotificationManager
+  interruptionFilter: AndroidInterruptionFilter;
+  permissionDndGranted: boolean;
+  permissionBackgroundLocation: boolean;
+  batteryLevel?: number;
+  currentLatitude?: number;
+  currentLongitude?: number;
+  activeZoneName?: string;
+  lastSyncTimestamp?: number;
+  appVersion?: string;
+  monitoringEnabled?: boolean;
+}
+
+export interface AndroidSyncState {
+  isConfigured: boolean;
+  pairingCode: string;
+  deviceId: string;
+  device: AndroidCompanionDevice | null;
+  lastSyncTime: number | null;
+  syncInProgress: boolean;
+  errorMessage: string | null;
+}
+
